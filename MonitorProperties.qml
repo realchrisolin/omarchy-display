@@ -77,6 +77,7 @@ PanelWindow {
 
   // Keyboard cursor: a row from `rows` and a column within it.
   readonly property var rows: ["resolution", "refresh", "scale", "rotation", "vrr", "actions"]
+  property var monitors: []
   property int cursorRow: 0
   property int cursorCol: 0
   property bool cursorActive: false
@@ -529,7 +530,7 @@ PanelWindow {
 
             Text {
               textFormat: Text.PlainText
-              text: root.monitor ? (root.internal ? "Built-in display" : LayoutModel.tileLabel(root.monitor)) : ""
+              text: root.monitor ? (root.internal ? "Built-in display" : LayoutModel.tileLabel(root.monitor, root.monitors)) : ""
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title

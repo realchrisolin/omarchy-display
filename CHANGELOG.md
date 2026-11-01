@@ -17,6 +17,12 @@ Bar entry is `DisplayPanel.qml` (`Panel.qml` is kept for merging upstream).
 - `MonitorLayoutHost` inside the bar widget holds layout apply during a
   P2P/RTSP handshake.
 
+### Changed
+
+- DISPLAY SETTINGS tiles (and the DISPLAYS list) are named by port:
+  Built-in, USB-C 1 / USB-C 2 on a laptop's DP connectors, HDMI 1, Miracast.
+  EDID model "Display" is no longer used as the tile title.
+
 ### Fixed
 
 - Left/right drops on DISPLAY SETTINGS stay in the row; a mainly vertical

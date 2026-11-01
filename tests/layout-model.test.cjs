@@ -144,11 +144,28 @@ test("kenya Hyprland disabled=true on a live eDP is still arranged", () => {
   assert.deepEqual(tiles.map(t => t.name), ["eDP-1", "persistent-miracast"])
 })
 
-test("tileLabel names the built-in panel and shows the model", () => {
+test("tileLabel names the built-in panel and HDMI by connector", () => {
   assert.equal(Model.tileLabel(laptop), "Built-in")
-  assert.equal(Model.tileLabel({ ...ultrawide, model: "U34V5C" }), "U34V5C")
-  assert.equal(Model.tileLabel(ultrawide), "AOC U34V5C")
-  assert.equal(Model.tileLabel({ name: "DP-3", description: "" }), "DP-3")
+  assert.equal(Model.tileLabel({ ...ultrawide, model: "U34V5C" }), "HDMI 1")
+  assert.equal(Model.tileLabel(ultrawide), "HDMI 1")
+  assert.equal(Model.tileLabel({ name: "DP-3", description: "" }), "DisplayPort 3")
+})
+
+test("tileLabel uses USB-C N for laptop DP connectors and HDMI N for HDMI", () => {
+  const hdmi = { ...ultrawide, name: "HDMI-A-1", model: "Display" }
+  const usb1 = { ...portrait, name: "DP-1", description: "BOE Display L56051794302", model: "Display" }
+  const usb2 = { ...portrait, name: "DP-2", description: "BOE Display other", model: "Display", x: 3840 }
+  const list = [laptop, usb1, usb2, hdmi]
+  assert.equal(Model.tileLabel(laptop, list), "Built-in")
+  assert.equal(Model.tileLabel(usb1, list), "USB-C 1")
+  assert.equal(Model.tileLabel(usb2, list), "USB-C 2")
+  assert.equal(Model.tileLabel(hdmi, list), "HDMI 1")
+  assert.equal(Model.tileLabel({ name: "persistent-miracast" }, list), "Miracast")
+  const tiles = Model.tilesFromMonitors(list)
+  assert.deepEqual(
+    Object.fromEntries(tiles.map(t => [t.name, t.label])),
+    { "eDP-1": "Built-in", "DP-1": "USB-C 1", "DP-2": "USB-C 2", "HDMI-A-1": "HDMI 1" }
+  )
 })
 
 // Desktop: two identical monitors, no built-in panel.
@@ -162,7 +179,7 @@ const dell = (name, x, serial) => ({
 
 test("desktop: identical models get distinct labels and keys", () => {
   const tiles = Model.tilesFromMonitors([dell("DP-1", 0, "S1"), dell("DP-2", 1920, "S2")])
-  assert.deepEqual(tiles.map(t => t.label), ["DELL P2419H · DP-1", "DELL P2419H · DP-2"])
+  assert.deepEqual(tiles.map(t => t.label), ["DisplayPort 1", "DisplayPort 2"])
   assert.deepEqual(tiles.map(t => t.key), ["Dell Inc. DELL P2419H S1", "Dell Inc. DELL P2419H S2"])
   assert.ok(tiles.every(t => !t.internal))
 })

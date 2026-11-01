@@ -1095,7 +1095,7 @@ Panel {
 
       Text {
         textFormat: Text.PlainText
-        text: monitorRow.display.name + (monitorRow.display.focused ? " · focused" : "")
+        text: LayoutModel.tileLabel(monitorRow.display, root.displays) + (monitorRow.display.focused ? " · focused" : "")
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.body

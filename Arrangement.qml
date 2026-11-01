@@ -343,6 +343,7 @@ Column {
     bar: root.bar
     hostPanel: root.panel
     miracast: root.miracast
+    monitors: root.monitors
     open: root.active && root.propertiesTile !== null
     monitor: {
       var tile = root.propertiesTile

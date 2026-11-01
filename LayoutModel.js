@@ -120,23 +120,57 @@ function withSavedGeometry(monitor, shared, monitorSettings) {
   return copy
 }
 
-// Short tile label: "Built-in" for the laptop panel, otherwise the model
-// ("U34V5C", "DELL P2419H"), falling back to the description's first words
-// and then to the output name.
-function tileLabel(monitor) {
-  if (isInternal(monitor)) return "Built-in"
-  if (isVirtualHead(monitor)) {
-    var virtModel = String(monitor.model || "").trim()
-    if (virtModel !== "") return virtModel
-    var virtWords = description(monitor).split(/\s+/).filter(function(word) { return word !== "" })
-    if (virtWords.length && virtWords[0] !== String(monitor.name || ""))
-      return virtWords.slice(0, 2).join(" ")
-    return "Miracast"
+// DRM connector kind + 1-based index from the Hyprland output name
+// (eDP-1, DP-2, HDMI-A-1). Index is the firmware connector number, so
+// USB-C 1 stays USB-C 1 whichever panel is plugged in.
+function connectorInfo(name) {
+  var n = String(name || "")
+  var m
+  if (VIRTUAL_OUTPUT.test(n) || n.indexOf("HEADLESS-") === 0)
+    return { kind: "miracast", index: 0 }
+  m = n.match(/^(?:eDP|LVDS|DSI)-(\d+)$/i)
+  if (m) return { kind: "builtin", index: +m[1] }
+  m = n.match(/^HDMI(?:-[AB])?-(\d+)$/i)
+  if (m) return { kind: "hdmi", index: +m[1] }
+  m = n.match(/^(?:DP|DisplayPort)-(\d+)$/i)
+  if (m) return { kind: "dp", index: +m[1] }
+  m = n.match(/^DVI-[DI]-(\d+)$/i)
+  if (m) return { kind: "dvi", index: +m[1] }
+  m = n.match(/^VGA-(\d+)$/i)
+  if (m) return { kind: "vga", index: +m[1] }
+  return { kind: "other", index: 0 }
+}
+
+function hasInternalPanel(monitors) {
+  for (var i = 0; i < (monitors || []).length; i++) {
+    if (isInternal(monitors[i])) return true
   }
-  var model = String(monitor.model || "").trim()
-  if (model !== "") return model
-  var words = description(monitor).split(/\s+/).filter(function(word) { return word !== "" })
-  return words.length ? words.slice(0, 2).join(" ") : String(monitor.name || "")
+  return false
+}
+
+// Laptop iGPUs expose USB-C DP-alt as DP-N (no full-size DisplayPort).
+function dpIsUsbC(monitors) {
+  return hasInternalPanel(monitors)
+}
+
+// Port-facing name: "Built-in", "USB-C 1", "HDMI 1", "Miracast".
+// Prefer this over EDID model: cheap panels report model "Display".
+function portLabel(monitor, monitors) {
+  var info = connectorInfo(monitor && monitor.name)
+  var n = info.index
+  switch (info.kind) {
+    case "builtin": return "Built-in"
+    case "miracast": return "Miracast"
+    case "hdmi": return "HDMI " + n
+    case "dp": return (dpIsUsbC(monitors) ? "USB-C " : "DisplayPort ") + n
+    case "dvi": return "DVI " + n
+    case "vga": return "VGA " + n
+    default: return String((monitor && monitor.name) || "Display")
+  }
+}
+
+function tileLabel(monitor, monitors) {
+  return portLabel(monitor, monitors)
 }
 
 // Keeps only the fields of a per-monitor settings entry that are valid,
@@ -1176,13 +1210,13 @@ function tilesFromMonitors(monitors, stack, monitorSettings, order) {
   var shared = sharedDescriptions(previewable.filter(isPackable))
   var labelCount = {}
   previewable.forEach(function(monitor) {
-    var label = tileLabel(monitor)
+    var label = tileLabel(monitor, previewable)
     labelCount[label] = (labelCount[label] || 0) + 1
   })
   var list = previewable.map(function(monitor) {
     var geom = isVirtualHead(monitor) ? monitor : withSavedGeometry(monitor, shared, monitorSettings)
     var size = logicalSize(geom)
-    var label = tileLabel(monitor)
+    var label = tileLabel(monitor, previewable)
     var virtual = isVirtualHead(monitor)
     var key = virtual ? String(monitor.name) : monitorKey(monitor, shared)
     var slot = byName[String(monitor.name)]
@@ -1395,6 +1429,8 @@ if (typeof module !== "undefined") {
     monitorKey: monitorKey,
     sharedDescriptions: sharedDescriptions,
     isInternal: isInternal,
+    connectorInfo: connectorInfo,
+    portLabel: portLabel,
     isVirtualHead: isVirtualHead,
     isParkedVirtual: isParkedVirtual,
     isPreviewable: isPreviewable,
