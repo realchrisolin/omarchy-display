@@ -32,10 +32,116 @@ test("logicalSize applies scale and rotation", () => {
   assert.deepEqual(Model.logicalSize(portrait), { w: 1080, h: 1920 })
 })
 
+test("computePositions packs from saved scale, not stale live scale", () => {
+  const edp = { ...laptop, name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0 }
+  const usb = { ...portrait, name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920 }
+  const settings = {
+    [Model.monitorKey(edp)]: { scale: 1 },
+    [Model.monitorKey(usb)]: { scale: 1.5 }
+  }
+  const positions = Model.computePositions([edp, usb], [Model.monitorKey(edp), Model.monitorKey(usb)], {}, settings)
+  const byName = Object.fromEntries(positions.map(p => [p.name, p]))
+  assert.equal(byName["eDP-1"].x, 0)
+  assert.equal(byName["DP-2"].x, 1920)
+  const both = Model.computePositions([edp, usb], [Model.monitorKey(edp), Model.monitorKey(usb)], {}, {
+    [Model.monitorKey(edp)]: { scale: 1.5 },
+    [Model.monitorKey(usb)]: { scale: 1.5 }
+  })
+  assert.equal(Object.fromEntries(both.map(p => [p.name, p]))["DP-2"].x, 1280)
+})
+
+test("physicalReloadLua position matches JSON scale", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 1920, disabled: false, mirrorOf: "none" }
+  const lua = Model.physicalReloadLua([edp, usb], {
+    order: [Model.monitorKey(edp), Model.monitorKey(usb)],
+    monitors: {
+      [Model.monitorKey(edp)]: { scale: 1, transform: 0 },
+      [Model.monitorKey(usb)]: { scale: 1.5, transform: 2 }
+    }
+  })
+  assert.match(lua, /output = "DP-2".*position = "1920x0".*scale = 1\.5/)
+})
+
+test("physicalReloadLua follows JSON order (USB-C left of eDP)", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 1920, disabled: false, mirrorOf: "none" }
+  const lua = Model.physicalReloadLua([edp, usb], {
+    order: [Model.monitorKey(usb), Model.monitorKey(edp)],
+    monitors: {
+      [Model.monitorKey(edp)]: { scale: 1, transform: 0 },
+      [Model.monitorKey(usb)]: { scale: 1, transform: 2 }
+    }
+  })
+  assert.match(lua, /output = "DP-2".*position = "0x0"/)
+  assert.match(lua, /output = "eDP-1".*position = "1920x0"/)
+})
+
+test("tilesFromMonitors uses saved scale for tile size", () => {
+  const usb = { name: "DP-2", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, disabled: false, mirrorOf: "none" }
+  const tiles = Model.tilesFromMonitors([usb], {}, { [Model.monitorKey(usb)]: { scale: 1.5 } })
+  assert.equal(tiles[0].w, 1280)
+})
+
 test("disabled and mirrored monitors are not arranged", () => {
   assert.equal(Model.isArrangeable({ ...ultrawide, disabled: true }), false)
   assert.equal(Model.isArrangeable({ ...ultrawide, mirrorOf: "eDP-1" }), false)
   assert.equal(Model.isArrangeable(ultrawide), true)
+})
+
+const virt = {
+  name: "persistent-miracast",
+  description: "",
+  width: 1920, height: 1080, scale: 1, transform: 0,
+  x: -1920, y: 0, focused: false, disabled: false, mirrorOf: "none"
+}
+
+test("Miracast virtual heads pack in the row, not as hl.monitor targets", () => {
+  assert.equal(Model.isVirtualHead(virt), true)
+  assert.equal(Model.isArrangeable(virt), false)
+  assert.equal(Model.isPackable(virt), true)
+  const parked = { ...virt, x: -12000 }
+  assert.equal(Model.isParkedVirtual(parked), true)
+  const order = [Model.monitorKey(laptop), Model.monitorKey(ultrawide), "persistent-miracast"]
+  const positions = Model.computePositions([laptop, virt, ultrawide], order)
+  assert.deepEqual(positions.map(p => p.name), ["eDP-1", "HDMI-A-1", "persistent-miracast"])
+  assert.equal(positions.find(p => p.name === "persistent-miracast").x, 1536 + 3440)
+  const tiles = Model.tilesFromMonitors([laptop, virt, ultrawide], {}, {}, order)
+  assert.equal(tiles.find(t => t.virtual).x, 1536 + 3440)
+  const lua = Model.physicalReloadLua([laptop, virt, ultrawide], { order, monitors: {} })
+  assert.equal(/output = "persistent-miracast"/.test(lua), false)
+})
+
+test("migrateLayoutOrder appends Miracast to the right of hardware", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-1", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const layout = { order: [Model.monitorKey(usb), Model.monitorKey(edp)], monitors: {} }
+  const next = Model.migrateLayoutOrder(layout, [edp, usb, virt])
+  assert.deepEqual(next.order[next.order.length - 1], "persistent-miracast")
+  const serialized = JSON.parse(Model.serializeLayout(next))
+  assert.ok(serialized.order.includes("persistent-miracast"))
+  const keys = next.order.slice()
+  const stepped = Model.withRowPosition(next, "persistent-miracast", keys, keys.indexOf("persistent-miracast") - 1)
+  assert.equal(stepped.order.indexOf("persistent-miracast"), keys.indexOf("persistent-miracast") - 1)
+  const tiles = Model.tilesFromMonitors([edp, usb, virt], {}, {}, next.order)
+  const tv = tiles.find(t => t.virtual)
+  const laptopTile = tiles.find(t => t.name === "eDP-1")
+  assert.equal(tv.x, laptopTile.x + laptopTile.w)
+})
+
+test("kenya Hyprland disabled=true on a live eDP is still arranged", () => {
+  const edp = {
+    ...laptop,
+    disabled: true,
+    dpmsStatus: true,
+    focused: true,
+    width: 1920,
+    height: 1080,
+  }
+  assert.equal(Model.isPresenting(edp), true)
+  assert.equal(Model.isArrangeable(edp), true)
+  const tiles = Model.tilesFromMonitors([edp, virt], {}, {}, ["eDP-1", "persistent-miracast"])
+  assert.deepEqual(tiles.map(t => t.name), ["eDP-1", "persistent-miracast"])
 })
 
 test("tileLabel names the built-in panel and shows the model", () => {
@@ -135,6 +241,93 @@ test("positionsToLua stages monitors before moving them into place", () => {
     'hl.monitor({ output = "HDMI-A-1", position = "0x0" })',
     'hl.monitor({ output = "eDP-1", position = "3440x0" })'
   ])
+})
+
+test("positionsToLua omits an already-placed Miracast head so eDP can unstack", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, miracast: true }
+  const positions = Model.computePositions([edp, tv], ["persistent-miracast", "Chimei"])
+  const lua = Model.positionsToLua(positions, Model.stagingX([edp, tv], positions))
+  assert.equal(/persistent-miracast/.test(lua), false)
+  assert.match(lua, /eDP-1/)
+  assert.ok(Model.packableOverlap([edp, tv]))
+})
+
+test("connect lands eDP off the origin before a new Miracast head is created", () => {
+  const edp = {
+    name: "eDP-1",
+    description: "Chimei Innolux Corporation 0x14E7",
+    width: 1920, height: 1080, scale: 1, transform: 0,
+    x: 0, y: 0, disabled: true, dpmsStatus: true, focused: true, mirrorOf: "none"
+  }
+  const layout = {
+    order: ["persistent-miracast", "Chimei Innolux Corporation 0x14E7"],
+    monitors: {},
+    stack: {}
+  }
+  const lua = Model.landingLuaForConnect([edp], layout, {
+    name: "persistent-miracast", width: 1920, height: 1080, scale: 1
+  })
+  assert.equal(lua, 'hl.monitor({ output = "eDP-1", position = "1920x0" })')
+  assert.equal(Model.boxHitsPackable([edp], { x: 0, y: 0, w: 1920, h: 1080 }, "persistent-miracast"), true)
+})
+
+test("a head already at 0x0 does not count as hitting itself once eDP has moved", () => {
+  const edp = {
+    name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7",
+    width: 1920, height: 1080, scale: 1, transform: 0,
+    x: 1920, y: 0, disabled: true, dpmsStatus: true, focused: true, mirrorOf: "none"
+  }
+  const tv = {
+    name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0,
+    x: 0, y: 0, disabled: true, dpmsStatus: true, focused: false, mirrorOf: "none", miracast: true
+  }
+  const layout = { order: ["persistent-miracast", edp.description], monitors: {}, stack: {} }
+  assert.equal(Model.landingLuaForConnect([edp, tv], layout, { name: tv.name, width: 1920, height: 1080, scale: 1 }), "")
+  assert.equal(Model.boxHitsPackable([edp, tv], { x: 0, y: 0, w: 1920, h: 1080 }, tv.name), false)
+  assert.equal(Model.boxHitsPackable([{ ...edp, x: 0 }, tv], { x: 0, y: 0, w: 1920, h: 1080 }, tv.name), true)
+})
+
+test("a reconnect does not teleport a cursor that is already on the laptop", () => {
+  const edp = { name: "eDP-1", x: 1920, y: 0, width: 1920, height: 1080, scale: 1, transform: 0 }
+  const tv = { name: "persistent-miracast", x: 0, y: 0, width: 1920, height: 1080, scale: 1, transform: 0, miracast: true }
+  assert.equal(Model.cursorRescue([edp, tv], { x: 2709, y: 481 }, "eDP-1"), null)
+  assert.equal(Model.cursorRescue(
+    [{ ...edp, x: 0, disabled: true, dpmsStatus: true, focused: true }, { ...tv, x: 0, disabled: true, dpmsStatus: true }],
+    { x: 800, y: 400 },
+    "eDP-1"
+  ), null)
+})
+
+test("a cursor on the Miracast head returns to the same spot on the laptop", () => {
+  const edp = { name: "eDP-1", x: 1920, y: 0, width: 1920, height: 1080, scale: 1, transform: 0 }
+  const tv = { name: "persistent-miracast", x: 0, y: 0, width: 1920, height: 1080, scale: 1, transform: 0, miracast: true }
+  assert.deepEqual(Model.cursorRescue([edp, tv], { x: 400, y: 200 }, "eDP-1"), { x: 2320, y: 200 })
+})
+
+test("sliding eDP keeps the cursor on the same laptop pixel", () => {
+  const edp = { name: "eDP-1", width: 1920, height: 1080, scale: 1, transform: 0 }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, miracast: true }
+  assert.deepEqual(
+    Model.cursorFollow([{ ...edp, x: 0, y: 0 }, { ...tv, x: 0, y: 0 }], [{ ...edp, x: 1920, y: 0 }, { ...tv, x: 0, y: 0 }], { x: 800, y: 400 }),
+    { x: 2720, y: 400 }
+  )
+  assert.equal(
+    Model.cursorFollow([{ ...edp, x: 1920, y: 0 }, { ...tv, x: 0, y: 0 }], [{ ...edp, x: 1920, y: 0 }, { ...tv, x: -12000, y: 0 }], { x: 2500, y: 100 }),
+    null
+  )
+})
+
+test("a Miracast move comes after eDP has landed, so a rejected head cannot abort it", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, miracast: true }
+  const positions = Model.computePositions([edp, tv], ["persistent-miracast", "Chimei"])
+  const lines = Model.positionsToLua(positions, Model.stagingX([edp, tv], positions)).split("\n")
+  const edpFinal = lines.findLastIndex(line => line.includes('"eDP-1"') && line.includes('"1920x0"'))
+  const tvLine = lines.findIndex(line => line.includes("persistent-miracast"))
+  assert.ok(edpFinal >= 0)
+  assert.ok(tvLine > edpFinal)
+  assert.ok(positions.some(p => p.name === "persistent-miracast" && p.changed))
 })
 
 test("staged moves never overlap, whichever way the monitors swap", () => {
@@ -341,6 +534,36 @@ test("pendingSettings ignores disabled monitors and entries with no saved settin
   assert.deepEqual(Model.pendingSettings([dell("DP-1", 0, "S1")], { order: [], monitors: {} }), [])
 })
 
+test("physicalReloadLua writes scale/transform for hardware outputs and skips Miracast", () => {
+  const lua = Model.physicalReloadLua([laptop, portrait, virt], {
+    order: [Model.monitorKey(laptop), Model.monitorKey(portrait)],
+    monitors: {
+      [Model.monitorKey(portrait)]: { scale: 1.25, transform: 2 }
+    }
+  })
+  assert.match(lua, /output = "eDP-1"/)
+  assert.match(lua, /output = "DP-2"/)
+  assert.match(lua, /scale = 1\.25/)
+  assert.match(lua, /transform = 2/)
+  assert.equal(/output = "persistent-miracast"/.test(lua), false)
+  assert.equal(/output = "HEADLESS/.test(lua), false)
+})
+
+test("snapshotPhysicalSettings does not overwrite saved scale/rotation with live", () => {
+  const layout = {
+    order: [],
+    monitors: {
+      "gone TV": { scale: 1.6, transform: 1 },
+      [Model.monitorKey(portrait)]: { scale: 1.25, transform: 2, vrr: 2 }
+    }
+  }
+  const next = Model.snapshotPhysicalSettings([portrait], layout)
+  assert.equal(next.monitors["gone TV"].scale, 1.6)
+  assert.equal(next.monitors[Model.monitorKey(portrait)].scale, 1.25)
+  assert.equal(next.monitors[Model.monitorKey(portrait)].transform, 2)
+  assert.equal(next.monitors[Model.monitorKey(portrait)].vrr, 2)
+})
+
 test("settingsToLua joins rules with newlines", () => {
   const pending = [
     { name: "eDP-1", settings: { scale: 2 } },
@@ -395,6 +618,27 @@ test("withExternal round-trips and defaults to extend", () => {
   assert.equal(Model.withOrder(layout, ["b"]).withExternal, "external-only")
   assert.deepEqual(Model.withOrder(layout, ["b"]).order, ["b", "a"])
   assert.equal(Model.withMonitorSettings(layout, "a", { scale: 2 }).withExternal, "external-only")
+})
+
+test("shouldHoldLayout is true only during P2P/RTSP handshake", () => {
+  assert.equal(Model.shouldHoldLayout({ phase: "connecting" }), true)
+  assert.equal(Model.shouldHoldLayout({ phase: "dhcp" }), true)
+  assert.equal(Model.shouldHoldLayout({ phase: "rtsp" }), true)
+  assert.equal(Model.shouldHoldLayout({ phase: "streaming" }), false)
+  assert.equal(Model.shouldHoldLayout({ phase: "idle" }), false)
+  assert.equal(Model.shouldHoldLayout({}), false)
+  assert.equal(Model.shouldHoldLayout({ phase: "idle" }, true), true)
+  assert.equal(Model.shouldHoldLayout({ phase: "streaming" }, true), false)
+})
+
+test("Win+P ignores Miracast virtual heads as externals", () => {
+  const virt = {
+    name: "persistent-miracast",
+    disabled: false, mirrorOf: "none",
+    width: 1920, height: 1080, scale: 1, x: -12000, y: 0
+  }
+  assert.equal(Model.externalModeCommand([laptop, virt], "external-only"), null)
+  assert.equal(Model.externalModeCommand([laptop, virt], "mirror"), null)
 })
 
 test("externalModeCommand acts only with a laptop screen and an external display", () => {
@@ -465,6 +709,19 @@ test("cleanStack keeps only well-formed entries", () => {
     d: { on: "b", side: "left" }, e: "x" }), { a: { on: "b", side: "above" } })
 })
 
+test("dropTarget does not stack onto Miracast; vertical drop uses the laptop", () => {
+  const tiles = [
+    { key: "Chimei", left: 0, top: 40, width: 40, height: 30, stacked: false, internal: true },
+    { key: "persistent-miracast", left: 40, top: 40, width: 40, height: 30, stacked: false, virtual: true },
+    { key: "BOE", left: 80, top: 40, width: 40, height: 30, stacked: false }
+  ]
+  // USB-C dragged up over the Miracast column (between laptop and USB-C).
+  assert.deepEqual(Model.dropTarget(tiles, 2, -40, -40), { side: "above", on: "Chimei" })
+  // USB-C dragged up in place (same column).
+  assert.deepEqual(Model.dropTarget(tiles, 2, 0, -40), { side: "above", on: "Chimei" })
+  assert.deepEqual(Model.dropTarget(tiles, 2, 0, 40), { side: "below", on: "Chimei" })
+})
+
 test("dropTarget stacks above or below, otherwise picks a row index", () => {
   const tiles = [
     { key: "L", left: 0, top: 40, width: 40, height: 30, stacked: false },
@@ -498,4 +755,112 @@ test("withDisplayEnabled switches one DISPLAYS row without touching the input", 
   const on = Model.withDisplayEnabled(off.displays, "DP-1", true)
   assert.equal(on.enabledDisplayCount, 2)
   assert.deepEqual(Model.withDisplayEnabled(null, "DP-1", true), { displays: [], enabledDisplayCount: 0 })
+})
+
+function _noOverlap(positions, w, h) {
+  for (let i = 0; i < positions.length; i++) {
+    for (let j = i + 1; j < positions.length; j++) {
+      const a = positions[i], b = positions[j]
+      const hit = a.x < b.x + w && b.x < a.x + w && a.y < b.y + h && b.y < a.y + h
+      assert.equal(hit, false, `${a.name}@${a.x},${a.y} vs ${b.name}@${b.x},${b.y}`)
+    }
+  }
+}
+
+test("USB-C stacked above eDP keeps Miracast in the row without overlap", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-1", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 3840, y: 0, miracast: true }
+  const kedp = Model.monitorKey(edp)
+  const kusb = Model.monitorKey(usb)
+  const stack = { [kusb]: { on: kedp, side: "above" } }
+  const order = [kedp, "persistent-miracast"]
+  const positions = Model.computePositions([edp, usb, tv], order, stack, {})
+  const by = Object.fromEntries(positions.map(p => [p.name, p]))
+  assert.equal(by["DP-1"].y, 0)
+  assert.equal(by["eDP-1"].y, 1080)
+  assert.equal(by["persistent-miracast"].y, 1080)
+  _noOverlap(positions, 1920, 1080)
+  const xy = Model.packedVirtualXY([edp, usb, tv], { order, stack, monitors: {} })
+  assert.deepEqual(xy, { x: by["persistent-miracast"].x, y: by["persistent-miracast"].y })
+})
+
+test("Miracast stacked above eDP packs at y=0 without overlapping USB-C", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const usb = { name: "DP-1", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, miracast: true }
+  const kedp = Model.monitorKey(edp)
+  const kusb = Model.monitorKey(usb)
+  const layout = {
+    order: [kedp, kusb],
+    stack: { "persistent-miracast": { on: kedp, side: "above" } },
+    monitors: {}
+  }
+  const positions = Model.computePositions([edp, usb, tv], layout.order, layout.stack, {})
+  const by = Object.fromEntries(positions.map(p => [p.name, p]))
+  assert.equal(by["persistent-miracast"].y, 0)
+  assert.equal(by["eDP-1"].y, 1080)
+  _noOverlap(positions, 1920, 1080)
+  const xy = Model.packedVirtualXY([edp, usb, tv], layout)
+  assert.equal(xy.y, 0)
+})
+
+test("applyVirtualDrop stacks Miracast above a physical tile", () => {
+  const layout = { order: ["eDP-1", "persistent-miracast"], monitors: {}, stack: {} }
+  const stacked = Model.applyVirtualDrop(layout, "persistent-miracast", { side: "above", on: "eDP-1" }, ["eDP-1"])
+  assert.deepEqual(stacked.stack["persistent-miracast"], { on: "eDP-1", side: "above" })
+  const rowed = Model.applyVirtualDrop(stacked, "persistent-miracast", { side: "row", index: 1 }, ["eDP-1"])
+  assert.equal(rowed.stack["persistent-miracast"], undefined)
+  assert.deepEqual(rowed.order, ["eDP-1", "persistent-miracast"])
+})
+
+test("Miracast above Built-In unstacks USB-C from that side instead of piling", () => {
+  const kedp = "Chimei Innolux Corporation 0x14E7"
+  const kusb = "BOE Display L56051794302"
+  const layout = {
+    order: [kedp, "persistent-miracast", kusb],
+    monitors: {},
+    stack: { [kusb]: { on: kedp, side: "above" } }
+  }
+  const next = Model.applyVirtualDrop(
+    layout, "persistent-miracast", { side: "above", on: kedp }, [kedp, kusb]
+  )
+  assert.deepEqual(next.stack["persistent-miracast"], { on: kedp, side: "above" })
+  assert.equal(next.stack[kusb], undefined)
+})
+
+test("dropTarget for the wifi tile stacks on the laptop, not USB-C above it", () => {
+  const tiles = [
+    { key: "Chimei", left: 10, top: 50, width: 40, height: 30, stacked: false, internal: true },
+    { key: "BOE", left: 10, top: 10, width: 40, height: 30, stacked: true, internal: false },
+    { key: "persistent-miracast", left: 55, top: 50, width: 40, height: 30, stacked: false, virtual: true }
+  ]
+  assert.deepEqual(Model.dropTarget(tiles, 2, -40, -40), { side: "above", on: "Chimei" })
+})
+
+test("dropTarget left/right of the laptop stays a row insert when the drag is mainly sideways", () => {
+  const tiles = [
+    { key: "Chimei", left: 10, top: 50, width: 40, height: 30, stacked: false, internal: true },
+    { key: "BOE", left: 10, top: 10, width: 40, height: 30, stacked: true, internal: false },
+    { key: "persistent-miracast", left: 55, top: 50, width: 40, height: 30, stacked: false, virtual: true }
+  ]
+  // Wifi dragged left of the group with a little upward slip: row, not above.
+  assert.deepEqual(Model.dropTarget(tiles, 2, -80, -20), { side: "row", index: 0 })
+  // USB-C stacked above, dragged left of the laptop: unstack into the row.
+  assert.deepEqual(Model.dropTarget(tiles, 1, -40, -10), { side: "row", index: 0 })
+  // USB-C stacked above, dragged right over Miracast with a little slip: right of laptop.
+  assert.deepEqual(Model.dropTarget(tiles, 1, 40, -10), { side: "row", index: 1 })
+  // Equal up-and-right over the Miracast column still stacks on the laptop.
+  assert.deepEqual(Model.dropTarget(tiles, 1, 40, -40), { side: "above", on: "Chimei" })
+})
+
+test("layoutWithExtendPosition above stacks on the laptop", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const tv = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, miracast: true }
+  const kedp = Model.monitorKey(edp)
+  const layout = { order: [kedp, "persistent-miracast"], monitors: {}, stack: {} }
+  const above = Model.layoutWithExtendPosition(layout, [edp, tv], "above")
+  assert.deepEqual(above.stack["persistent-miracast"], { on: kedp, side: "above" })
+  const left = Model.layoutWithExtendPosition(layout, [edp, tv], "left")
+  assert.equal(left.order[0], "persistent-miracast")
 })

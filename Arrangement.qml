@@ -35,6 +35,8 @@ Column {
   property bool cursorActive: false
   // Host KeyboardPanel; the properties window opens beside its card.
   property var panel: null
+  // MiracastService: drag the HEADLESS tile to set extendPosition.
+  property var miracast: null
 
   readonly property string orderPath: Quickshell.env("HOME") + "/.config/omarchy/monitor-layout.json"
 
@@ -54,7 +56,15 @@ Column {
   }
   // One display still gets the section, for its settings; reordering needs two.
   readonly property bool available: tiles.length > 0
-  readonly property bool reorderable: tiles.length > 1
+  readonly property bool reorderable: {
+    var phys = 0
+    var virt = 0
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i].virtual) virt++
+      else phys++
+    }
+    return phys > 1 || (phys >= 1 && virt > 0)
+  }
 
   // Keyboard cursor over the tiles, and the tile picked up with Enter (-1 = none).
   property int selectedIndex: 0
@@ -68,6 +78,11 @@ Column {
 
   // Hover asks the host panel to move its keyboard focus here.
   signal focusRequested()
+
+  Connections {
+    target: root.miracast
+    function onExtendPositionChanged() { if (root.active) root.refresh() }
+  }
 
   function refresh() {
     if (!monitorsProc.running) monitorsProc.running = true
@@ -95,6 +110,24 @@ Column {
     if (grabbedIndex < 0) return
     var tile = tiles[grabbedIndex]
     var side = dy < 0 ? "above" : "below"
+    if (tile.virtual) {
+      var entryV = LayoutModel.activeStack(monitors, orderFile.layout.stack)[tile.key]
+      if (entryV) {
+        if (entryV.side !== side) {
+          var rowV = rowKeys()
+          saveLayout(LayoutModel.withRowPosition(orderFile.layout, tile.key, rowV,
+            rowV.indexOf(baseKey(tile.key)) + 1))
+        }
+        return
+      }
+      var edp = null
+      for (var v = 0; v < tiles.length; v++) {
+        if (tiles[v].internal) { edp = tiles[v]; break }
+      }
+      if (!edp) return
+      saveLayout(LayoutModel.withVirtualStacked(orderFile.layout, tile.key, edp.key, side))
+      return
+    }
     var entry = LayoutModel.activeStack(monitors, orderFile.layout.stack)[tile.key]
     if (entry) {
       // Moving back towards the monitor it stands on returns it to the row.
@@ -150,7 +183,8 @@ Column {
 
   // Identify: number every display on its screen for a few seconds.
   function identify() {
-    identifyOutputs = tiles.map(function(tile) { return tile.name })
+    identifyOutputs = tiles.filter(function(tile) { return !tile.virtual })
+      .map(function(tile) { return tile.name })
     identifyTimer.restart()
   }
 
@@ -160,8 +194,25 @@ Column {
     propertiesOutput = tiles[selectedIndex].name
   }
 
-  // Stop keeping a setting for an output, e.g. when the panel's SCALE row
-  // changes the scale in monitors.lua, which should then win.
+  // Persist per-output scale/rotation in JSON, then LayoutApplier evals,
+  // rereads, and packs. Do not call omarchy-hyprland-monitor-scaling here:
+  // that sed's eDP's omarchy_monitor_scale even when USB-C is focused.
+  function rememberSettings(output, settings) {
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i].name !== output) continue
+      orderFile.saveSettings(tiles[i].key, settings)
+      applier.apply()
+      return
+    }
+    var shared = LayoutModel.sharedDescriptions(monitors)
+    for (var j = 0; j < monitors.length; j++) {
+      if (String(monitors[j].name) !== output) continue
+      orderFile.saveSettings(LayoutModel.monitorKey(monitors[j], shared), settings)
+      applier.apply()
+      return
+    }
+  }
+
   function forgetSetting(output, field) {
     for (var i = 0; i < tiles.length; i++) {
       if (tiles[i].name !== output) continue
@@ -176,9 +227,24 @@ Column {
 
   // Where a dragged tile was dropped (LayoutModel.dropTarget): persist and
   // apply it; the tiles follow once the live layout has moved.
-  function dropTile(from, target) {
+  function dropTile(from, target, dx) {
+    if (!tiles[from]) return
+    if (tiles[from].virtual) {
+      saveLayout(LayoutModel.applyVirtualDrop(orderFile.layout, tiles[from].key, target, rowKeys()))
+      return
+    }
     var tile = tiles[from]
     if (!tile || !target) return
+    if (target.on) {
+      for (var i = 0; i < tiles.length; i++) {
+        if (tiles[i].key === target.on && tiles[i].virtual) {
+          var base = baseKey(target.on)
+          if (!base || base === tile.key) return
+          target = { side: target.side, on: base }
+          break
+        }
+      }
+    }
     if (target.side === "row")
       saveLayout(LayoutModel.withRowPosition(orderFile.layout, tile.key, rowKeys(), target.index))
     else
@@ -221,7 +287,15 @@ Column {
         var monitors = []
         try { monitors = JSON.parse(String(text || "[]")) } catch (e) { monitors = [] }
         root.monitors = monitors
-        root.tiles = LayoutModel.tilesFromMonitors(monitors, orderFile.layout.stack)
+        var layout = LayoutModel.migrateLayoutOrder(orderFile.layout, monitors)
+        if (JSON.stringify(layout.order) !== JSON.stringify(orderFile.layout.order || []))
+          orderFile.saveLayout(layout)
+        root.tiles = LayoutModel.tilesFromMonitors(
+          monitors,
+          layout.stack,
+          layout.monitors,
+          layout.order
+        )
       }
     }
   }
@@ -246,7 +320,9 @@ Column {
     function saveLayout(next) {
       layout = next
       setText(LayoutModel.serializeLayout(layout))
-      applier.apply()
+      root.tiles = LayoutModel.tilesFromMonitors(
+        root.monitors, layout.stack, layout.monitors, layout.order)
+      applier.apply(false, next)
     }
 
     // Service.qml sees the change and carries the mode out.
@@ -266,6 +342,7 @@ Column {
     id: properties
     bar: root.bar
     hostPanel: root.panel
+    miracast: root.miracast
     open: root.active && root.propertiesTile !== null
     monitor: {
       var tile = root.propertiesTile
@@ -317,7 +394,7 @@ Column {
     id: row
     width: parent.width
     // Taller once a display stands above or below another.
-    height: canvas.stacked ? Style.space(170) : Style.space(110)
+    height: (canvas.stacked || root.reorderable) ? Style.space(170) : Style.space(110)
     hasCursor: root.cursorActive && root.focused
     foreground: root.bar.foreground
     outline: true
@@ -361,6 +438,8 @@ Column {
         return {
           key: tile.key,
           stacked: tile.stacked,
+          virtual: !!tile.virtual,
+          internal: !!tile.internal,
           left: groupLeft + (tile.x - bounds.left) * unit + gap / 2,
           top: groupTop + (tile.y - bounds.top) * unit + gap / 2,
           width: Math.max(1, tile.w * unit - gap),
@@ -377,6 +456,28 @@ Column {
       // Where the tile being dragged would land, for the edge marker.
       readonly property var dropPreview: dragIndex >= 0 ? target(dragIndex, dragX, dragY) : null
 
+      // Accent line on a neighbour: above/below that tile, or left/right of
+      // the insertion edge among remaining row tiles.
+      function dropSideFor(tileIndex) {
+        var p = dropPreview
+        if (!p) return ""
+        if ((p.side === "above" || p.side === "below") && tiles[tileIndex] && p.on === tiles[tileIndex].key)
+          return p.side
+        if (p.side !== "row" || dragIndex < 0) return ""
+        var remaining = []
+        for (var i = 0; i < tiles.length; i++) {
+          if (i === dragIndex || tiles[i].stacked) continue
+          remaining.push(i)
+        }
+        if (!remaining.length) return ""
+        var at = p.index
+        if (at <= 0) return remaining[0] === tileIndex ? "left" : ""
+        if (at >= remaining.length) return remaining[remaining.length - 1] === tileIndex ? "right" : ""
+        if (remaining[at - 1] === tileIndex) return "right"
+        if (remaining[at] === tileIndex) return "left"
+        return ""
+      }
+
       function finishDrag() {
         var from = dragIndex
         var dx = dragX
@@ -385,7 +486,7 @@ Column {
         dragX = 0
         dragY = 0
         if (from < 0 || (Math.abs(dx) < 2 && Math.abs(dy) < 2)) return
-        root.dropTile(from, target(from, dx, dy))
+        root.dropTile(from, target(from, dx, dy), dx)
       }
 
       Repeater {
@@ -404,13 +505,13 @@ Column {
           z: dragged ? 2 : 0
           width: restRect.width
           height: restRect.height
-          icon: modelData.internal ? "󰌢" : "󰍹"
+          icon: modelData.virtual ? "󰖩" : (modelData.internal ? "󰌢" : "󰍹")
           label: modelData.label
           number: index + 1
           highlighted: modelData.focused
           grabbed: dragged || root.grabbedIndex === index
           hasCursor: root.cursorActive && root.focused && root.selectedIndex === index
-          dropSide: canvas.dropPreview && canvas.dropPreview.on === modelData.key ? canvas.dropPreview.side : ""
+          dropSide: canvas.dropSideFor(index)
 
           MouseArea {
             anchors.fill: parent
@@ -444,11 +545,13 @@ Column {
               // never reach the bottom or top edge of another to stack there.
               canvas.dragX = Math.max(-r.left - r.width / 2,
                 Math.min(canvas.width - r.left - r.width / 2, at.x - pressAt.x))
-              canvas.dragY = Math.max(-r.top - r.height / 2,
-                Math.min(canvas.height - r.top - r.height / 2, at.y - pressAt.y))
+              canvas.dragY = Math.max(-r.top - r.height,
+                Math.min(canvas.height - r.top, at.y - pressAt.y))
             }
             onReleased: canvas.finishDrag()
-            onDoubleClicked: root.propertiesOutput = screenTile.modelData.name
+            onDoubleClicked: {
+              root.propertiesOutput = screenTile.modelData.name
+            }
             onCanceled: {
               canvas.dragIndex = -1
               canvas.dragX = 0
@@ -482,19 +585,38 @@ Column {
       anchors.verticalCenter: parent.verticalCenter
     }
 
-    Button {
+    Row {
       id: identifyButton
-      text: "Identify"
-      fontSize: Style.font.caption
-      foreground: root.bar.foreground
-      fontFamily: root.bar.fontFamily
-      horizontalPadding: Style.spacing.md
-      verticalPadding: Style.spacing.controlPaddingY
-      bordered: true
-      active: root.identifyOutputs.length > 0
+      spacing: Style.spacing.xs
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      onClicked: root.identify()
+
+      Button {
+        text: "Settings"
+        fontSize: Style.font.caption
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        horizontalPadding: Style.spacing.md
+        verticalPadding: Style.spacing.controlPaddingY
+        bordered: true
+        enabled: root.tiles.length > 0
+        onClicked: {
+          var tile = root.tiles[root.selectedIndex] || root.tiles.filter(function(t) { return t.focused })[0] || root.tiles[0]
+          if (tile) root.propertiesOutput = tile.name
+        }
+      }
+
+      Button {
+        text: "Identify"
+        fontSize: Style.font.caption
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        horizontalPadding: Style.spacing.md
+        verticalPadding: Style.spacing.controlPaddingY
+        bordered: true
+        active: root.identifyOutputs.length > 0
+        onClicked: root.identify()
+      }
     }
   }
 
@@ -543,6 +665,49 @@ Column {
     }
   }
 
+  Column {
+    visible: root.miracast && root.miracast.active
+    width: parent.width
+    spacing: Style.space(10)
+    topPadding: Style.space(4)
+
+    PanelSectionHeader {
+      text: "WITH A MIRACAST DISPLAY"
+      foreground: root.bar.foreground
+      fontFamily: root.bar.fontFamily
+    }
+
+    Grid {
+      id: miracastModeRow
+      width: parent.width
+      columns: 2
+      spacing: Style.spacing.xs
+
+      readonly property real cellWidth: (width - spacing * (columns - 1)) / columns
+
+      Repeater {
+        model: [
+          { value: "extend", label: "Extend" },
+          { value: "mirror", label: "Mirror" }
+        ]
+
+        Button {
+          required property var modelData
+          width: miracastModeRow.cellWidth
+          text: modelData.label
+          fontSize: Style.font.caption
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          horizontalPadding: Style.spacing.sm
+          verticalPadding: Style.spacing.controlPaddingY
+          bordered: true
+          active: root.miracast && root.miracast.mode === modelData.value
+          onClicked: if (root.miracast) root.miracast.setMode(modelData.value)
+        }
+      }
+    }
+  }
+
   // Numbers the displays on their screens: all of them for a moment after
   // Identify, and the one whose settings window is open.
   IdentifyOverlay {
@@ -584,7 +749,7 @@ Column {
     property string icon: ""
     property string label: ""
     property int number: 0
-    // "above" / "below": the dragged display would land on this edge.
+    // "above" / "below" / "left" / "right": the dragged display would land here.
     property string dropSide: ""
     property bool highlighted: false
     property bool grabbed: false
@@ -599,13 +764,24 @@ Column {
     border.color: hasCursor ? root.bar.foreground : (highlighted ? Color.accent : line)
 
     Rectangle {
-      visible: tile.dropSide !== ""
+      visible: tile.dropSide === "above" || tile.dropSide === "below"
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.top: tile.dropSide === "above" ? parent.top : undefined
       anchors.bottom: tile.dropSide === "below" ? parent.bottom : undefined
       height: Math.max(2, Style.space(3))
       radius: height / 2
+      color: Color.accent
+    }
+
+    Rectangle {
+      visible: tile.dropSide === "left" || tile.dropSide === "right"
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.left: tile.dropSide === "left" ? parent.left : undefined
+      anchors.right: tile.dropSide === "right" ? parent.right : undefined
+      width: Math.max(2, Style.space(3))
+      radius: width / 2
       color: Color.accent
     }
 

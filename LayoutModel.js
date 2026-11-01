@@ -41,11 +41,60 @@ function isInternal(monitor) {
   return INTERNAL_OUTPUT.test(String((monitor && monitor.name) || ""))
 }
 
-// Disabled and mirrored outputs take no space in the layout.
+// Miracast Extend heads (Hyprland headless). Packed in computePositions.
+// hl.monitor / lua skip them. miracast-ctl parks at -12000 and places at packed x,y.
+var VIRTUAL_OUTPUT = /^(HEADLESS|persistent-miracast|Miracast)/
+
+function isVirtualHead(monitor) {
+  if (!monitor) return false
+  if (monitor.miracast) return true
+  var name = String(monitor.name || "")
+  if (VIRTUAL_OUTPUT.test(name)) return true
+  if (name.indexOf("HEADLESS-") === 0) return true
+  return false
+}
+
+// miracast-ctl parks unused Extend heads at -12000. Those must not pull the
+// arrangement preview's bounding box off to the left.
+function isParkedVirtual(monitor) {
+  if (!isVirtualHead(monitor)) return false
+  return (Number(monitor.x) || 0) <= -10000
+}
+
+// Physical arrangeable outputs, plus the Miracast HEADLESS head (parked or
+// live) so DISPLAY SETTINGS can place it. Layout apply still uses isArrangeable
+// only; place-virtual-head owns the real output.
+function isPreviewable(monitor) {
+  if (isArrangeable(monitor)) return true
+  if (!isVirtualHead(monitor)) return false
+  var w = Number(monitor.width) || 0
+  var h = Number(monitor.height) || 0
+  return w > 0 && h > 0
+}
+
+// Hyprland on kenya (ICC fork) reports disabled=true on the focused, DPMS-on
+// eDP. Trust size + DPMS/focus; only skip a disabled output that is not presenting.
+function isPresenting(monitor) {
+  if (!monitor) return false
+  var w = Number(monitor.width) || 0
+  var h = Number(monitor.height) || 0
+  if (w <= 0 || h <= 0) return false
+  if (monitor.focused) return true
+  if (monitor.dpmsStatus === true) return true
+  if (monitor.disabled === true) return false
+  return true
+}
+
+// Off, mirrored, and Miracast virtual heads take no space in the layout.
 function isArrangeable(monitor) {
-  if (!monitor || monitor.disabled) return false
+  if (!isPresenting(monitor)) return false
+  if (isVirtualHead(monitor)) return false
   var mirrorOf = monitor.mirrorOf
   return mirrorOf === undefined || mirrorOf === null || mirrorOf === "" || mirrorOf === "none"
+}
+
+function isPackable(monitor) {
+  return isArrangeable(monitor) || (isVirtualHead(monitor) && isPreviewable(monitor))
 }
 
 function logicalSize(monitor) {
@@ -57,11 +106,33 @@ function logicalSize(monitor) {
   return { w: Math.round(width / scale), h: Math.round(height / scale) }
 }
 
+// Copy of `monitor` with JSON scale/transform when those fields are saved, so
+// packing uses intended logical size even if hyprctl still has the old scale.
+function withSavedGeometry(monitor, shared, monitorSettings) {
+  var saved = (monitorSettings || {})[monitorKey(monitor, shared)]
+    || (monitorSettings || {})[String(monitor.name || "")]
+    || {}
+  if (saved.scale === undefined && saved.transform === undefined) return monitor
+  var copy = {}
+  for (var k in monitor) copy[k] = monitor[k]
+  if (saved.scale !== undefined) copy.scale = saved.scale
+  if (saved.transform !== undefined) copy.transform = saved.transform
+  return copy
+}
+
 // Short tile label: "Built-in" for the laptop panel, otherwise the model
 // ("U34V5C", "DELL P2419H"), falling back to the description's first words
 // and then to the output name.
 function tileLabel(monitor) {
   if (isInternal(monitor)) return "Built-in"
+  if (isVirtualHead(monitor)) {
+    var virtModel = String(monitor.model || "").trim()
+    if (virtModel !== "") return virtModel
+    var virtWords = description(monitor).split(/\s+/).filter(function(word) { return word !== "" })
+    if (virtWords.length && virtWords[0] !== String(monitor.name || ""))
+      return virtWords.slice(0, 2).join(" ")
+    return "Miracast"
+  }
   var model = String(monitor.model || "").trim()
   if (model !== "") return model
   var words = description(monitor).split(/\s+/).filter(function(word) { return word !== "" })
@@ -201,6 +272,17 @@ function withExternalMode(layout, mode) {
   return copy
 }
 
+// True while Miracast is in P2P/RTSP handshake. Layout must not modeset eDP
+// in that window (GO Neg + eDP place has locked i915 on kenya).
+// connecting.lock covers the gap before status.json says connecting; once
+// streaming, layout may apply to physical monitors again.
+function shouldHoldLayout(status, lockPresent) {
+  var phase = String((status && status.phase) || "").toLowerCase()
+  if (phase === "connecting" || phase === "dhcp" || phase === "rtsp") return true
+  if (lockPresent && phase !== "streaming") return true
+  return false
+}
+
 // The next Omarchy command that brings `monitors` (`hyprctl monitors all -j`)
 // in line with `mode`, or null when nothing has to change. One step at a
 // time: each command reloads the config, which brings the service back here
@@ -216,7 +298,7 @@ function externalModeCommand(monitors, mode) {
   for (var i = 0; i < list.length; i++) {
     if (isInternal(list[i])) {
       if (!internal) internal = list[i]
-    } else if (!list[i].disabled) {
+    } else if (!list[i].disabled && !isVirtualHead(list[i])) {
       externals.push(list[i])
     }
   }
@@ -382,7 +464,11 @@ function settingsRule(name, settings) {
 // the same way rank() looks up a saved order entry: by monitorKey first,
 // falling back to the output name.
 function pendingSettings(monitors, layout) {
-  var list = (monitors || []).filter(function(monitor) { return monitor && !monitor.disabled })
+  var list = (monitors || []).filter(function(monitor) {
+    if (!monitor) return false
+    if (isArrangeable(monitor)) return true
+    return isVirtualHead(monitor) && isPreviewable(monitor)
+  })
   var shared = sharedDescriptions(list)
   var monitorSettings = (layout && layout.monitors) || {}
   var result = []
@@ -399,6 +485,81 @@ function pendingSettings(monitors, layout) {
 
 function settingsToLua(pending) {
   return (pending || []).map(function(p) { return settingsRule(p.name, p.settings) }).join("\n")
+}
+
+// Merge live arrangeable (non-virtual) settings into layout.monitors so
+// scale/rotation survive hyprctl reload. Unplugged keys stay. vrr 2 is kept
+// because hyprctl JSON cannot tell fullscreen-only VRR from off.
+function snapshotPhysicalSettings(monitors, layout) {
+  var list = (monitors || []).filter(isArrangeable)
+  var shared = sharedDescriptions(list)
+  var monitorsOut = {}
+  var source = (layout && layout.monitors) || {}
+  for (var k in source) {
+    if (Object.prototype.hasOwnProperty.call(source, k)) monitorsOut[k] = source[k]
+  }
+  for (var i = 0; i < list.length; i++) {
+    var m = list[i]
+    var key = monitorKey(m, shared)
+    var live = liveSettings(m)
+    var prev = monitorsOut[key] || {}
+    // Never copy live over a saved scale/rotation — after hyprctl reload
+    // live is Hyprland defaults until JSON is applied.
+    monitorsOut[key] = cleanSettings({
+      mode: prev.mode !== undefined ? prev.mode : live.mode,
+      scale: prev.scale !== undefined ? prev.scale : live.scale,
+      transform: prev.transform !== undefined ? prev.transform : live.transform,
+      vrr: prev.vrr !== undefined ? prev.vrr : live.vrr
+    })
+  }
+  return {
+    order: (layout && layout.order) || [],
+    monitors: monitorsOut,
+    withExternal: layout && layout.withExternal,
+    stack: layout && layout.stack
+  }
+}
+
+// hl.monitor rules for physical outputs only, for ~/.config/hypr/monitors-layout.lua.
+// hyprctl reload reads this after monitors.lua so DP-2 scale/rotation persist.
+function physicalReloadLua(monitors, layout) {
+  var list = (monitors || []).filter(isArrangeable)
+  var header = [
+    "-- Generated by realchrisolin.display from ~/.config/omarchy/monitor-layout.json",
+    "-- Physical outputs only. persistent-miracast / HEADLESS* are omitted.",
+    ""
+  ]
+  if (list.length === 0) return header.join("\n") + "-- No physical outputs.\n"
+  var positions = computePositions(
+    monitors,
+    (layout && layout.order) || [],
+    (layout && layout.stack) || {},
+    (layout && layout.monitors) || {}
+  )
+  var byName = {}
+  for (var p = 0; p < positions.length; p++) byName[positions[p].name] = positions[p]
+  var shared = sharedDescriptions(list)
+  var saved = (layout && layout.monitors) || {}
+  var lines = header.slice()
+  for (var i = 0; i < list.length; i++) {
+    var m = list[i]
+    var key = monitorKey(m, shared)
+    var prev = saved[key] || saved[String(m.name || "")] || {}
+    var live = liveSettings(m)
+    var pos = byName[m.name]
+    var parts = ["output = " + luaString(m.name)]
+    var mode = prev.mode !== undefined ? prev.mode : live.mode
+    if (mode) parts.push("mode = " + luaString(mode))
+    if (pos) parts.push("position = " + luaString(pos.x + "x" + pos.y))
+    var scale = prev.scale !== undefined ? prev.scale : live.scale
+    parts.push("scale = " + scale)
+    var transform = prev.transform !== undefined ? prev.transform : live.transform
+    parts.push("transform = " + transform)
+    var vrr = prev.vrr !== undefined ? prev.vrr : live.vrr
+    if (vrr !== undefined) parts.push("vrr = " + vrr)
+    lines.push("hl.monitor({ " + parts.join(", ") + " })")
+  }
+  return lines.join("\n") + "\n"
 }
 
 // Screen diagonal in inches, rounded to 1 decimal. 0 when the physical size
@@ -431,6 +592,27 @@ function rotationLabel(transform) {
 
 // Keys placed by the user come first; remembered monitors that are not
 // connected right now keep their relative order after them.
+// Insert the Miracast head into layout.order once. Default: right of the
+// packed hardware row. Ignore leftover extendPosition when USB-C already
+// occupies the left of eDP.
+function migrateLayoutOrder(layout, monitors) {
+  var copy = copyLayout(layout)
+  var virt = null
+  for (var i = 0; i < (monitors || []).length; i++) {
+    if (isVirtualHead(monitors[i]) && isPreviewable(monitors[i])) {
+      virt = monitors[i]
+      break
+    }
+  }
+  if (!virt) return copy
+  var shared = sharedDescriptions((monitors || []).filter(isPackable))
+  var key = String(virt.name || "persistent-miracast")
+  var order = (copy.order || []).slice()
+  if (order.indexOf(key) >= 0) return copy
+  copy.order = order.concat([key])
+  return copy
+}
+
 function mergeOrder(keys, previous) {
   var merged = keys.slice()
   for (var i = 0; i < (previous || []).length; i++) {
@@ -448,7 +630,7 @@ function rank(order, monitor, shared) {
 // Monitors in the saved order come first, in that order. Unknown ones follow,
 // keeping their current left-to-right position.
 function sortMonitors(monitors, order) {
-  var list = (monitors || []).filter(isArrangeable).slice()
+  var list = (monitors || []).filter(isPackable).slice()
   var shared = sharedDescriptions(list)
   order = order || []
   list.sort(function(a, b) {
@@ -467,7 +649,7 @@ function sortMonitors(monitors, order) {
 // the one it stands on are both arrangeable, and following `on` never loops.
 // { key: { on, side } } keyed like the row (monitorKey).
 function activeStack(monitors, stack) {
-  var list = (monitors || []).filter(isArrangeable)
+  var list = (monitors || []).filter(isPackable)
   var shared = sharedDescriptions(list)
   var present = {}
   list.forEach(function(monitor) { present[monitorKey(monitor, shared)] = true })
@@ -490,12 +672,14 @@ function activeStack(monitors, stack) {
 // [{ name, x, y, changed }] for every arrangeable monitor. Row monitors go
 // left to right, top-aligned; stacked ones are centered above or below the
 // monitor they stand on. Everything is shifted so the layout starts at 0x0.
-function computePositions(monitors, order, stack) {
+function computePositions(monitors, order, stack, monitorSettings) {
   var active = activeStack(monitors, stack)
-  var list = (monitors || []).filter(isArrangeable)
+  var list = (monitors || []).filter(isPackable)
   var shared = sharedDescriptions(list)
   var byKey = {}
-  list.forEach(function(monitor) { byKey[monitorKey(monitor, shared)] = monitor })
+  list.forEach(function(monitor) {
+    byKey[monitorKey(monitor, shared)] = withSavedGeometry(monitor, shared, monitorSettings)
+  })
 
   var placed = {}
   var row = sortMonitors(monitors, order).filter(function(monitor) {
@@ -503,8 +687,9 @@ function computePositions(monitors, order, stack) {
   })
   var x = 0
   row.forEach(function(monitor) {
-    var size = logicalSize(monitor)
-    placed[monitorKey(monitor, shared)] = { monitor: monitor, x: x, y: 0, w: size.w, h: size.h }
+    var geom = withSavedGeometry(monitor, shared, monitorSettings)
+    var size = logicalSize(geom)
+    placed[monitorKey(monitor, shared)] = { monitor: geom, x: x, y: 0, w: size.w, h: size.h }
     x += size.w
   })
 
@@ -630,20 +815,48 @@ function cleanStack(raw) {
 // the top or bottom `edge` share of another tile (or clear above or below it,
 // within its width) stacks it there: { side: "above" | "below", on: key },
 // provided it was moved that way by at least a quarter of its own height, so
-// a sideways drag never stacks by accident. Anywhere else it joins the row at `index` among the other row tiles, left
-// to right, by its center.
+// a sideways drag never stacks by accident. A drag that leaves the packed
+// group's left/right, or that is more sideways than vertical over a wifi
+// column, joins the row at `index` among the other row tiles, left to right,
+// by its center.
 function dropTarget(tiles, from, dx, dy, edge) {
   var t = tiles && tiles[from]
   if (!t) return null
   var share = edge > 0 && edge < 0.5 ? edge : 0.3
   var cx = t.left + t.width / 2 + (dx || 0)
   var cy = t.top + t.height / 2 + (dy || 0)
+  var adx = Math.abs(dx || 0)
+  var ady = Math.abs(dy || 0)
+  var vertical = ady >= t.height / 4
+  var mainlyVertical = vertical && ady >= adx
 
-  var vertical = Math.abs(dy || 0) >= t.height / 4
+  var rowLeft = Infinity
+  var rowRight = -Infinity
+  var overInternal = false
+  for (var b = 0; b < tiles.length; b++) {
+    rowLeft = Math.min(rowLeft, tiles[b].left)
+    rowRight = Math.max(rowRight, tiles[b].left + tiles[b].width)
+    if (b === from) continue
+    if (tiles[b].internal && cx >= tiles[b].left && cx <= tiles[b].left + tiles[b].width)
+      overInternal = true
+  }
+  var pastRow = rowRight > rowLeft && (cx < rowLeft || cx > rowRight)
+
+  // Wifi tile: above/below is always the laptop, not USB-C sitting in that slot.
+  // Past the left/right of the packed group, or a mainly-sideways drag, is a
+  // row insert so the above-edge marker does not steal left/right placement.
+  if (t.virtual && mainlyVertical && !pastRow) {
+    var home = null
+    for (var h = 0; h < tiles.length; h++) {
+      if (h !== from && tiles[h].internal) { home = tiles[h]; break }
+    }
+    if (home) return { side: (dy || 0) < 0 ? "above" : "below", on: home.key }
+  }
   var best = null
-  for (var i = 0; i < tiles.length && vertical; i++) {
+  for (var i = 0; i < tiles.length && vertical && !pastRow; i++) {
     if (i === from) continue
     var o = tiles[i]
+    if (o.virtual) continue
     if (cx < o.left || cx > o.left + o.width) continue
     var bottom = o.top + o.height
     var side = null
@@ -658,6 +871,22 @@ function dropTarget(tiles, from, dx, dy, edge) {
     if (side && (!best || distance < best.distance)) best = { distance: distance, on: o.key, side: side }
   }
   if (best) return { side: best.side, on: best.on }
+  // Miracast sits in the packed row. A mainly-vertical drag over that column
+  // (or over empty space above the row, still inside the group's x-span)
+  // should still stack on the laptop. Past the left/right ends, or a drag
+  // that is more sideways than vertical, stays a row insert.
+  if (mainlyVertical && !pastRow && !overInternal) {
+    var home = null
+    for (var h = 0; h < tiles.length; h++) {
+      if (h !== from && tiles[h].internal) { home = tiles[h]; break }
+    }
+    if (!home) {
+      for (var p = 0; p < tiles.length; p++) {
+        if (p !== from && !tiles[p].virtual) { home = tiles[p]; break }
+      }
+    }
+    if (home) return { side: (dy || 0) < 0 ? "above" : "below", on: home.key }
+  }
 
   var index = 0
   for (var j = 0; j < tiles.length; j++) {
@@ -673,13 +902,28 @@ function luaString(value) {
 
 // First free x to the right of every monitor, both where they are now and
 // where they are going. Staging monitors there keeps the move overlap-free.
-function stagingX(monitors, positions) {
+function stagingX(monitors, positions, monitorSettings) {
   var right = 0
-  var list = (monitors || []).filter(isArrangeable)
-  for (var i = 0; i < list.length; i++)
-    right = Math.max(right, (Number(list[i].x) || 0) + logicalSize(list[i]).w)
+  var list = (monitors || []).filter(isPackable)
+  var shared = sharedDescriptions(list.filter(isArrangeable))
+  for (var i = 0; i < list.length; i++) {
+    var geom = isVirtualHead(list[i]) ? list[i] : withSavedGeometry(list[i], shared, monitorSettings)
+    right = Math.max(right, (Number(list[i].x) || 0) + logicalSize(geom).w)
+  }
+  for (var p = 0; p < (positions || []).length; p++) {
+    var w = Number(positions[p].w)
+    if (!(w > 0)) {
+      var mon = null
+      for (var m = 0; m < list.length; m++) {
+        if (String(list[m].name) === String(positions[p].name)) { mon = list[m]; break }
+      }
+      w = mon ? logicalSize(isVirtualHead(mon) ? mon : withSavedGeometry(mon, shared, monitorSettings)).w : 0
+    }
+    right = Math.max(right, (Number(positions[p].x) || 0) + w)
+  }
   var total = 0
-  for (var j = 0; j < list.length; j++) total += logicalSize(list[j]).w
+  for (var j = 0; j < list.length; j++)
+    total += logicalSize(isVirtualHead(list[j]) ? list[j] : withSavedGeometry(list[j], shared, monitorSettings)).w
   return Math.max(right, total)
 }
 
@@ -703,18 +947,192 @@ function positionRule(name, x, y) {
 // returning monitor appear beside the layout instead.
 function positionsToLua(positions, staging, parked) {
   var lines = []
+  var phys = (positions || []).filter(function(p) { return !isVirtualHead({ name: p.name }) })
+  var virt = (positions || []).filter(function(p) { return isVirtualHead({ name: p.name }) })
   if (staging !== undefined && staging !== null) {
-    for (var i = 0; i < positions.length; i++)
-      lines.push(positionRule(positions[i].name, staging + positions[i].x, positions[i].y))
+    for (var i = 0; i < phys.length; i++)
+      lines.push(positionRule(phys[i].name, staging + phys[i].x, phys[i].y))
   }
-  for (var j = 0; j < positions.length; j++)
-    lines.push(positionRule(positions[j].name, positions[j].x, positions[j].y))
+  for (var j = 0; j < phys.length; j++)
+    lines.push(positionRule(phys[j].name, phys[j].x, phys[j].y))
   for (var k = 0; k < (parked || []).length; k++)
     lines.push("hl.monitor({ output = " + luaString(parked[k]) + ", position = \"auto-right\" })")
+  // After every physical rule. A rejected HEADLESS rule aborts the rest of
+  // the eval; placed earlier, that abort left eDP stacked at 0x0 (lock-screen
+  // overlap, cursor on both). place-virtual-head repeats the move on its own
+  // when this rule does not apply.
+  for (var v = 0; v < virt.length; v++) {
+    if (virt[v].changed)
+      lines.push(positionRule(virt[v].name, virt[v].x, virt[v].y))
+  }
   return lines.join("\n")
 }
 
-// Outputs from `known` that are not placed by `positions`, i.e. unplugged.
+// True when two packable outputs share compositor space (cursor on both,
+// Hyprland "monitor layout overlaps"). Lock reload of monitors.lua (eDP 0x0)
+// while persistent-miracast is also at 0x0 is the usual case.
+function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+function packableOverlap(monitors) {
+  var list = (monitors || []).filter(isPackable)
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i]
+    var asz = logicalSize(a)
+    for (var j = i + 1; j < list.length; j++) {
+      var b = list[j]
+      var bsz = logicalSize(b)
+      if (rectsOverlap(Number(a.x) || 0, Number(a.y) || 0, asz.w, asz.h, Number(b.x) || 0, Number(b.y) || 0, bsz.w, bsz.h))
+        return true
+    }
+  }
+  return false
+}
+
+// True when `box` shares area with a packable output other than `ignoreName`.
+// Touching edges do not count. Used so place-virtual-head will not land the
+// Extend head on eDP (Hyprland's overlap warning, cursor on both outputs).
+function boxHitsPackable(monitors, box, ignoreName) {
+  var x = Number(box && box.x) || 0
+  var y = Number(box && box.y) || 0
+  var w = Number(box && box.w) || 0
+  var h = Number(box && box.h) || 0
+  if (w <= 0 || h <= 0) return false
+  var list = (monitors || []).filter(isPackable)
+  for (var i = 0; i < list.length; i++) {
+    if (ignoreName && String(list[i].name) === String(ignoreName)) continue
+    var b = list[i]
+    var bsz = logicalSize(b)
+    if (rectsOverlap(x, y, w, h, Number(b.x) || 0, Number(b.y) || 0, bsz.w, bsz.h))
+      return true
+  }
+  return false
+}
+
+// Position-only rules that move physical monitors to the packed row.
+// The virtual head is omitted: miracast-ctl places it after this eval.
+// When the head is not connected yet, `virtualHead` is inserted as a
+// placeholder so eDP slides off the origin the new headless output occupies.
+// Empty when every physical monitor is already there.
+function landingLuaForConnect(monitors, layout, virtualHead) {
+  var list = (monitors || []).slice()
+  var spec = virtualHead || {}
+  var vname = String(spec.name || "persistent-miracast")
+  var have = false
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i].name) === vname) { have = true; break }
+  }
+  if (!have) {
+    list.push({
+      name: vname,
+      description: vname,
+      width: Number(spec.width) > 0 ? Number(spec.width) : 1920,
+      height: Number(spec.height) > 0 ? Number(spec.height) : 1080,
+      scale: Number(spec.scale) > 0 ? Number(spec.scale) : 1,
+      transform: 0,
+      x: -12000,
+      y: 0,
+      disabled: false,
+      dpmsStatus: true,
+      focused: false,
+      mirrorOf: "none",
+      miracast: true
+    })
+  }
+  var positions = computePositions(
+    list,
+    (layout && layout.order) || [],
+    (layout && layout.stack) || {},
+    (layout && layout.monitors) || {}
+  )
+  var lines = []
+  for (var p = 0; p < positions.length; p++) {
+    if (isVirtualHead({ name: positions[p].name })) continue
+    if (!positions[p].changed) continue
+    lines.push(positionRule(positions[p].name, positions[p].x, positions[p].y))
+  }
+  return lines.join("\n")
+}
+
+function logicalBox(monitor) {
+  var size = logicalSize(monitor)
+  return {
+    x: Number(monitor && monitor.x) || 0,
+    y: Number(monitor && monitor.y) || 0,
+    w: size.w,
+    h: size.h
+  }
+}
+
+function pointInBox(box, x, y) {
+  return x >= box.x && y >= box.y && x < box.x + box.w && y < box.y + box.h
+}
+
+// null when the pointer is already on a physical monitor: do not teleport it.
+// Otherwise land it on `primaryName` at the same relative spot it had on the
+// virtual head, or at the nearest point of the laptop if it is in empty space.
+// Never the center. A reconnect that always warps to center is the jump.
+function cursorRescue(monitors, cursor, primaryName) {
+  var x = Number(cursor && cursor.x) || 0
+  var y = Number(cursor && cursor.y) || 0
+  var list = monitors || []
+  var primary = null
+  var onPhysical = false
+  var virtualHit = null
+  for (var i = 0; i < list.length; i++) {
+    var box = logicalBox(list[i])
+    if (box.w <= 0 || box.h <= 0) continue
+    if (String(list[i].name) === String(primaryName)) primary = box
+    if (!pointInBox(box, x, y)) continue
+    if (isVirtualHead(list[i])) {
+      if (!virtualHit) virtualHit = box
+    } else {
+      onPhysical = true
+    }
+  }
+  if (onPhysical || !primary) return null
+  var dx = x - (virtualHit ? virtualHit.x : primary.x)
+  var dy = y - (virtualHit ? virtualHit.y : primary.y)
+  if (virtualHit && virtualHit.w > 0) dx = dx * primary.w / virtualHit.w
+  if (virtualHit && virtualHit.h > 0) dy = dy * primary.h / virtualHit.h
+  dx = Math.max(0, Math.min(primary.w - 1, Math.round(dx)))
+  dy = Math.max(0, Math.min(primary.h - 1, Math.round(dy)))
+  var nx = primary.x + dx
+  var ny = primary.y + dy
+  if (nx === x && ny === y) return null
+  return { x: nx, y: ny }
+}
+
+// After a monitor moves, keep a pointer that was on a physical output on that
+// same pixel. Virtual heads are ignored so parking one cannot drag the cursor
+// to -12000.
+function cursorFollow(before, after, cursor) {
+  var x = Number(cursor && cursor.x) || 0
+  var y = Number(cursor && cursor.y) || 0
+  var host = null
+  var list = before || []
+  for (var i = 0; i < list.length; i++) {
+    if (isVirtualHead(list[i])) continue
+    var box = logicalBox(list[i])
+    if (box.w <= 0 || box.h <= 0) continue
+    if (pointInBox(box, x, y)) { host = list[i]; break }
+  }
+  if (!host) return null
+  var now = null
+  var next = after || []
+  for (var j = 0; j < next.length; j++) {
+    if (String(next[j].name) === String(host.name)) { now = next[j]; break }
+  }
+  if (!now) return null
+  var oldBox = logicalBox(host)
+  var newBox = logicalBox(now)
+  var nx = newBox.x + (x - oldBox.x)
+  var ny = newBox.y + (y - oldBox.y)
+  if (nx === x && ny === y) return null
+  return { x: nx, y: ny }
+}
+
 function parkedOutputs(known, positions) {
   var placed = {}
   for (var i = 0; i < positions.length; i++) placed[positions[i].name] = true
@@ -748,34 +1166,208 @@ function dropIndex(tiles, from, offset) {
 // View model for the panel: arrangeable monitors sorted by current position,
 // left to right then top to bottom. `stacked` marks the ones standing on
 // another monitor (see activeStack).
-function tilesFromMonitors(monitors, stack) {
+function tilesFromMonitors(monitors, stack, monitorSettings, order) {
+  var layoutOrder = order || []
+  var packed = computePositions(monitors, layoutOrder, stack, monitorSettings)
+  var byName = {}
+  for (var p = 0; p < packed.length; p++) byName[packed[p].name] = packed[p]
   var active = activeStack(monitors, stack)
-  var arrangeable = (monitors || []).filter(isArrangeable)
-  var shared = sharedDescriptions(arrangeable)
+  var previewable = (monitors || []).filter(isPreviewable)
+  var shared = sharedDescriptions(previewable.filter(isPackable))
   var labelCount = {}
-  arrangeable.forEach(function(monitor) {
+  previewable.forEach(function(monitor) {
     var label = tileLabel(monitor)
     labelCount[label] = (labelCount[label] || 0) + 1
   })
-  var list = arrangeable.map(function(monitor) {
-    var size = logicalSize(monitor)
+  var list = previewable.map(function(monitor) {
+    var geom = isVirtualHead(monitor) ? monitor : withSavedGeometry(monitor, shared, monitorSettings)
+    var size = logicalSize(geom)
     var label = tileLabel(monitor)
+    var virtual = isVirtualHead(monitor)
+    var key = virtual ? String(monitor.name) : monitorKey(monitor, shared)
+    var slot = byName[String(monitor.name)]
     return {
       name: String(monitor.name),
-      key: monitorKey(monitor, shared),
-      // Identical models get their port appended: "P2419H · DP-1".
+      key: key,
       label: labelCount[label] > 1 ? label + " · " + monitor.name : label,
       internal: isInternal(monitor),
+      virtual: virtual,
       focused: monitor.focused === true,
-      stacked: !!active[monitorKey(monitor, shared)],
-      x: Number(monitor.x) || 0,
-      y: Number(monitor.y) || 0,
+      stacked: !!active[key],
+      x: slot ? slot.x : (Number(monitor.x) || 0),
+      y: slot ? slot.y : (Number(monitor.y) || 0),
       w: size.w,
       h: size.h
     }
   })
   list.sort(function(a, b) { return a.x - b.x || a.y - b.y })
   return list
+}
+
+// Put the Miracast tile outside the packed physical row. Placing it only
+// against eDP overlapped USB-C when that panel already sat left of the laptop.
+// Packed x,y for the first virtual head (computePositions + stack).
+function packedVirtualXY(monitors, layout) {
+  var list = monitors || []
+  var virt = null
+  for (var i = 0; i < list.length; i++) {
+    if (isVirtualHead(list[i])) { virt = list[i]; break }
+  }
+  if (!virt) return { x: 0, y: 0 }
+  var order = ((layout && layout.order) || []).slice()
+  var vname = String(virt.name)
+  if (order.indexOf(vname) < 0) order.push(vname)
+  var positions = computePositions(
+    list, order, (layout && layout.stack) || {}, (layout && layout.monitors) || {}
+  )
+  for (var p = 0; p < positions.length; p++) {
+    if (String(positions[p].name) === vname)
+      return { x: positions[p].x, y: positions[p].y }
+  }
+  return { x: 0, y: 0 }
+}
+
+// Arrangement drop of the Miracast tile: row insert, or stack above/below a physical tile.
+function applyVirtualDrop(layout, virtKey, target, rowKeys) {
+  if (!layout || !virtKey) return layout
+  if (!target) return layout
+  if (target.side === "row")
+    return withRowPosition(layout, virtKey, rowKeys || [], target.index)
+  if ((target.side === "above" || target.side === "below") && target.on && target.on !== virtKey)
+    return withVirtualStacked(layout, virtKey, target.on, target.side)
+  return layout
+}
+
+// Miracast above/below a physical monitor. Do not pile on USB-C that already
+// occupies that side — that is the DISPLAY SETTINGS "above Built-In" miss.
+function withVirtualStacked(layout, virtKey, on, side) {
+  if (!virtKey || !on || virtKey === on) return copyLayout(layout)
+  var stack = {}
+  var source = (layout && layout.stack) || {}
+  var dir = side === "below" ? "below" : "above"
+  for (var k in source) {
+    if (!Object.prototype.hasOwnProperty.call(source, k) || k === virtKey) continue
+    if (source[k].on === on && source[k].side === dir) continue
+    stack[k] = source[k]
+  }
+  stack[virtKey] = { on: on, side: dir }
+  var copy = copyLayout(layout)
+  copy.stack = stack
+  return copy
+}
+
+function _internalKey(monitors) {
+  var list = monitors || []
+  for (var i = 0; i < list.length; i++) {
+    if (isInternal(list[i]) && isArrangeable(list[i])) return monitorKey(list[i])
+  }
+  for (var j = 0; j < list.length; j++) {
+    if (isArrangeable(list[j])) return monitorKey(list[j])
+  }
+  return ""
+}
+
+function _virtKey(monitors) {
+  var list = monitors || []
+  for (var i = 0; i < list.length; i++) {
+    if (isVirtualHead(list[i])) return String(list[i].name)
+  }
+  return ""
+}
+
+function _rowKeysWithout(layout, monitors, skip) {
+  var order = (layout && layout.order) || []
+  var stack = activeStack(monitors, (layout && layout.stack) || {})
+  var keys = []
+  var seen = {}
+  function push(key) {
+    if (!key || key === skip || seen[key] || stack[key]) return
+    seen[key] = true
+    keys.push(key)
+  }
+  for (var i = 0; i < order.length; i++) push(order[i])
+  var list = monitors || []
+  var shared = sharedDescriptions(list.filter(isPackable))
+  for (var j = 0; j < list.length; j++) {
+    if (isVirtualHead(list[j])) push(String(list[j].name))
+    else if (isArrangeable(list[j])) push(monitorKey(list[j], shared))
+  }
+  return keys
+}
+
+// Pills Left/Right/Above/Below → layout.order + layout.stack.
+function layoutWithExtendPosition(layout, monitors, position) {
+  var virtKey = _virtKey(monitors)
+  var edpKey = _internalKey(monitors)
+  if (!virtKey) return copyLayout(layout)
+  var pos = String(position || "right")
+  if (pos === "above" || pos === "below") {
+    if (!edpKey) return copyLayout(layout)
+    return withVirtualStacked(layout, virtKey, edpKey, pos)
+  }
+  var row = _rowKeysWithout(layout, monitors, virtKey)
+  if (pos === "left") return withRowPosition(layout, virtKey, row, 0)
+  return withRowPosition(layout, virtKey, row, row.length)
+}
+
+function applyExtendPreview(tiles, extendPosition) {
+  var virt = null
+  var left = Infinity
+  var right = -Infinity
+  var top = Infinity
+  var bottom = -Infinity
+  var rowY = 0
+  for (var i = 0; i < (tiles || []).length; i++) {
+    if (tiles[i].virtual) { virt = tiles[i]; continue }
+    left = Math.min(left, tiles[i].x)
+    right = Math.max(right, tiles[i].x + tiles[i].w)
+    top = Math.min(top, tiles[i].y)
+    bottom = Math.max(bottom, tiles[i].y + tiles[i].h)
+    if (tiles[i].internal) rowY = tiles[i].y
+  }
+  if (!virt || left === Infinity) return tiles
+  var pos = String(extendPosition || "right")
+  if (pos === "left") {
+    virt.x = left - virt.w
+    virt.y = rowY
+  } else if (pos === "above") {
+    virt.x = left + Math.round((right - left - virt.w) / 2)
+    virt.y = top - virt.h
+  } else if (pos === "below") {
+    virt.x = left + Math.round((right - left - virt.w) / 2)
+    virt.y = bottom
+  } else {
+    virt.x = right
+    virt.y = rowY
+  }
+  return tiles
+}
+
+// Map an Arrangement drop of the Miracast tile to extendPosition.
+function extendPositionFromDrop(tiles, from, target, dx) {
+  if (!tiles || from < 0 || from >= tiles.length) return ""
+  var virt = tiles[from]
+  if (!virt || !virt.virtual) return ""
+  var edp = null
+  for (var i = 0; i < tiles.length; i++) {
+    if (tiles[i].internal) { edp = tiles[i]; break }
+  }
+  if (!edp) return "right"
+  if (target && (target.side === "above" || target.side === "below") && target.on === edp.key)
+    return target.side
+  var cx = virt.x + (Number(dx) || 0) + virt.w / 2
+  var left = Infinity
+  var right = -Infinity
+  for (var j = 0; j < tiles.length; j++) {
+    if (tiles[j].virtual) continue
+    left = Math.min(left, tiles[j].x)
+    right = Math.max(right, tiles[j].x + tiles[j].w)
+  }
+  if (left === Infinity) {
+    var ecx = edp.x + edp.w / 2
+    return cx < ecx ? "left" : "right"
+  }
+  return cx < (left + right) / 2 ? "left" : "right"
 }
 
 // The Display panel's DISPLAYS rows with one output switched on or off, before
@@ -803,8 +1395,13 @@ if (typeof module !== "undefined") {
     monitorKey: monitorKey,
     sharedDescriptions: sharedDescriptions,
     isInternal: isInternal,
+    isVirtualHead: isVirtualHead,
+    isParkedVirtual: isParkedVirtual,
+    isPreviewable: isPreviewable,
+    isPresenting: isPresenting,
     isArrangeable: isArrangeable,
     logicalSize: logicalSize,
+    withSavedGeometry: withSavedGeometry,
     tileLabel: tileLabel,
     cleanSettings: cleanSettings,
     parseLayout: parseLayout,
@@ -823,11 +1420,14 @@ if (typeof module !== "undefined") {
     cleanExternalMode: cleanExternalMode,
     withOrder: withOrder,
     withExternalMode: withExternalMode,
+    shouldHoldLayout: shouldHoldLayout,
     externalModeCommand: externalModeCommand,
     extendCommands: extendCommands,
     settingsRule: settingsRule,
     pendingSettings: pendingSettings,
     settingsToLua: settingsToLua,
+    snapshotPhysicalSettings: snapshotPhysicalSettings,
+    physicalReloadLua: physicalReloadLua,
     diagonalInches: diagonalInches,
     pixelDensity: pixelDensity,
     rotationLabel: rotationLabel,
@@ -841,10 +1441,23 @@ if (typeof module !== "undefined") {
     dropTarget: dropTarget,
     stagingX: stagingX,
     positionsToLua: positionsToLua,
+    packableOverlap: packableOverlap,
+    boxHitsPackable: boxHitsPackable,
+    landingLuaForConnect: landingLuaForConnect,
+    cursorRescue: cursorRescue,
+    cursorFollow: cursorFollow,
     parkedOutputs: parkedOutputs,
     moveItem: moveItem,
     dropIndex: dropIndex,
+    isPackable: isPackable,
+    migrateLayoutOrder: migrateLayoutOrder,
     tilesFromMonitors: tilesFromMonitors,
+    packedVirtualXY: packedVirtualXY,
+    applyVirtualDrop: applyVirtualDrop,
+    withVirtualStacked: withVirtualStacked,
+    layoutWithExtendPosition: layoutWithExtendPosition,
+    applyExtendPreview: applyExtendPreview,
+    extendPositionFromDrop: extendPositionFromDrop,
     withDisplayEnabled: withDisplayEnabled
   }
 }
