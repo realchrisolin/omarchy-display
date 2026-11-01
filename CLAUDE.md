@@ -63,3 +63,20 @@ for Hyprland, and nothing else. See README.md for the user-facing description.
   installers and piping downloads into a shell, even when only mentioned in
   docs. Keep the plugin free of all of them and avoid naming those commands.
 - The plugin id `monitor-layout` is permanent once listed.
+
+## This fork (realchrisolin/omarchy-display)
+
+- Plugin id is `realchrisolin.display`. `clonedFrom: omarchy.monitor` stays so
+  the widget still receives the Display shortcut.
+- Bar entry is `DisplayPanel.qml`. Keep `Panel.qml` and `Service.qml` in the
+  tree for merging with upstream; do not point the manifest at `Panel.qml`
+  (it shadows `qs.Ui.Panel`).
+- Scope here includes Miracast / Wi-Fi Display on top of kris-1's layout.
+  Layout packing for virtual heads still lives in `LayoutModel.js` with tests.
+- Default branch is `master`. Remote `upstream` is
+  `kris-1/omarchy-monitor-layout`.
+- Live install: rsync into `~/.config/omarchy/plugins/realchrisolin.display`.
+  Do not run `scripts/dev-sync.sh` during a live Miracast session (it
+  restarts omarchy-shell).
+- Previous Display+Miracast without this layout: `v1-legacy` on
+  `realchrisolin/omarchy-display-original`.

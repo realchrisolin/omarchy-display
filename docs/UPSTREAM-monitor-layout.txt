@@ -1,0 +1,3 @@
+This repository is a GitHub fork of kris-1/omarchy-monitor-layout.
+Base commit: f02b9d1f48d76d45400344e42786c8552e4d3015 (Release 0.7.1)
+Upstream: https://github.com/kris-1/omarchy-monitor-layout

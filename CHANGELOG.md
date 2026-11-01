@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Fork of kris-1/omarchy-monitor-layout 0.7.1. Plugin id `realchrisolin.display`.
+Bar entry is `DisplayPanel.qml` (`Panel.qml` is kept for merging upstream).
+
+### Added
+
+- Miracast / Wi-Fi Display in the Display widget (scan, connect, mirror and
+  extend). Virtual Extend heads are packed with physical displays and never
+  written as `hl.monitor` rules.
+- `MonitorLayoutHost` inside the bar widget holds layout apply during a
+  P2P/RTSP handshake.
+
+### Fixed
+
+- Left/right drops on DISPLAY SETTINGS stay in the row; a mainly vertical
+  drag still stacks above or below.
+- Physical scale and rotation persist across `hyprctl reload` through
+  `monitors-layout.lua` (no virtual heads in that file).
+
 ## [0.7.1] - 2026-09-29
 
 ### Fixed

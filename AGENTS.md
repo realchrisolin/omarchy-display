@@ -1,0 +1,82 @@
+# Omarchy Miracast / Display plugin
+
+Quickshell Display bar plugin (`manifest.json` id **`realchrisolin.display`**) plus `bin/miracast-ctl` and `scripts/`. Cast path depends on a patched **FluxCast** tree (see README / BUILD.md).
+
+Keep this file short. Depth lives in the docs below — link, don’t paste.
+
+## Documentation
+
+| Doc | Audience / genre |
+|-----|------------------|
+| [README.md](README.md) | Install, settings keys, CLI, P2P channel, eDP lifecycle |
+| [docs/MIRACAST-HELP.md](docs/MIRACAST-HELP.md) | End-user tips, Doctor, encode / Best (Dynamic), troubleshooting |
+| [BUILD.md](BUILD.md) | FluxCast / wf-recorder / ICC performance PoC |
+| [BENCHMARKS.md](BENCHMARKS.md) | Measured encode / CPU matrix |
+
+## Hard constraints (do not regress)
+
+- **Never freeze eDP.** Do not call `hyprctl output remove` / `monitor,disable` on the Miracast hot path (connect, disconnect, orphan cleanup). Leave virtual heads in place; reuse on next Extend. Details: README § Virtual output lifecycle.
+- **Do not bounce hardware cursors** across Extend stop/start. Keep `cursor:no_hardware_cursors=true` while a virtual head exists (live or parked). Restoring the HW cursor plane in the same window as park/unpark modesets eDP and has hard-locked i915 (no VT, caps-lock LED stuck).
+- **Do not recover a parked Extend session from another VT.** Hyprland IPC that modesets, reloads the renderer, restarts the shell, or warps/focuses eDP while its tty is inactive, then `Ctrl+Alt+Fn` back onto that session, has hard-locked i915 (CPU may keep running; no `GPU hang` printk). Diagnose read-only; reboot if the graphical session is already abandoned. Lost eDP pointer with a parked head is the cursor on the virtual output, not a hung panel. Details: README § Virtual output lifecycle.
+- **LPCM-only sinks** are common. Prefer WFD LPCM (`stream_type=0x83`); don’t “fix” silence by switching away from LPCM without evidence.
+- **Quiet P2P by default = SCC.** Opt-in quiet CSA only (`p2pQuietCsa`). For air/UI freq: prefer peer **`oper_freq` when 5 GHz**; only fall back to `listen_freq` when iw GO merely mirrors STA 5 GHz and the peer has no 5 GHz oper (Intel MCC “iw lie”). Dual idle NIC preferred over sharing STA (`p2pWifiInterface=auto`). USB GO drops 5 GHz by default (`p2pGo5GHz=false`); dedicated USB `wpa_supplicant` is `usbWpaSupplicant` / `FLUXCAST_USB_WPA` (never a hardcoded path in FluxCast). Chip USB/GO workarounds live in FluxCast `wfd.p2p.stability` (sysfs driver/bus, not iface names). Privileged argv and P2P marker paths go through `wfd.p2p.safety` (no `all`/`default` iface, hex MAC filenames only). After GO Neg, `accept_acl ADD_MAC` both P2P device and interface addresses (wpa ACL is iface-only; device-address probes otherwise fail WPS).
+- **20 MHz / 2.4 GHz budget (updated from hotyeah soaks):** PHY still ~72 Mbps HT20; usable Miracast is lower, but **>20 Mbps can stay clear**. Older “corruption above ~22 Mbps” was **too conservative** for current DMA-BUF CQP. Practical cliff on this MCC path was closer to **~40–50 Mbps** (sharp QP / q=1) with retries→UDP death — not 20. Named High/Medium/Low remain conservative; **Very High** stays **5 GHz+** gated as a pinned sharp preset.
+- **RENDER ENGINE pills:** **GPU + DMA-BUF** / **GPU** / **CPU** (ids still `dmabuf`/`vaapi`/`cpu`). GPU pills show `(<card-reported lspci name>)`. GPU + DMA-BUF falls back to GPU pipe then CPU. DMA-BUF uses VAAPI when usable (Intel/AMD Mesa); NVIDIA skips DMA and uses NVENC on the GPU pipe when available.
+- **Encoding strategy** (`encodeStrategy`): **`smartview`** (default) = BitrateController on **DMA-BUF CBR** (Samsung dig: **min 2M / init 8M / max 14M**, QP bounds **15–44**; AOSP WFD CBR — Intel QVBR idle-UI undershoots). Opt in to QVBR via `vaapiRcMode=QVBR`. Use `prepare_dmabuf_settings()` on start/restart; pref=`dmabuf` stays sticky across SIGUSR1. **VAAPI QVBR target hit:** bitrate-driven (`qmin`/`qmax`, not fixed `qp=`), `minrate`≈70% of target, VBV ~2s — needs the **custom wf-recorder** build that applies `rc_min_rate` on `AVCodecContext` (set `wfRecorderBin`; stock PATH binary undershoots to ~3 Mbps). Starve→pipe only if air TX stays **&lt;~2.5 Mbps** absolute. **`performance`** = DMA-BUF **CQP** (Best uses QP ladder — no `set-bitrate-kbps`). Pipe: avoid **quality &lt; 3** / **async &gt; 1**.
+- **Best (Dynamic) + QVBR ABR:** `bitrate_controller.py` decide() every tick; **coalesce** SIGUSR1 applies (Δqp≥2 or Δkbps≥15%, min ~45s) for climbs. **Do not** invent LOSS from iw `retry%` (Smart View uses RTCP RR). Demote on NetStall/fps sag, hard `tx_failed`, or a **sink IDR burst** (WFD decoder starvation, 8s urgent apply). Stall demotes apply even if Δkbps &lt; 15% or Δqp=1, and may go to **800 kbps** (below Smart View 2M min) so the decoder can recover. Under **performance** → DMA-BUF **QP 1–51** ladder (`dynamic_encode.py`). **`encodeBestLocked`** freezes the step.
+- **Settle after 3 demotes:** climb hold only at **≥3 demotes**, until demotes **decay** (long clean streak) or **signal improves ≥10 dB**. Demotes 1–2 still allow climbing but a **soft climb ceiling** (encodeBestClimbFloorStep) blocks re-climbing sharper than the last demote target until demotes fully clear — stops the qp12→qp9→UDP race. Cliff climbs need a longer clean streak per step. **No hard permanent climb floor**.
+- **No leftover helpers:** audio-route runs as `scripts/miracast_audio_route_watch.sh` (own process group), link-watch / health-watch have pidfiles, and stop reaps orphans by name so `ps` does not fill with stuck `miracast-ctl start` shells. Stop also `pkill`s leftover `dnsmasq.*fluxcast-dnsmasq` (old `p2p-wlp0s20-*` leases). Start disconnects a Wi-Fi STA already on `192.168.49.0/24` (`scripts/p2p_subnet_clash.py`); Ethernet stays.
+- **Zombie session:** `cmd_status` must reconcile (1) phase=streaming but media frozen (Sender health video_frames flat ≥25s, or no health ≥45s) — stop and write idle; (2) `running=true` / connecting|dhcp|rtsp|streaming with a dead `cast.pid` / `status.pid` and no FluxCast python — persist idle (`running=false`; leftover GO keeps phase dhcp). connecting + dead pid is not live. UDP EBADF during rebind must not suppress stop forever (≤20s window).
+- **Disconnected cleanup (no sink):** when cast pid, FluxCast python, and P2P group are all gone, `cmd_status` must (a) persist `phase=idle` over stale `error`/connecting phases, (b) reap link/audio/health watchers, (c) clear `parked-headless.name` / `headless.name` only when Hyprland IPC works and the named head is absent (after compositor restart), (d) if the head still exists but is on-layout, re-park it at `-12000x0` (never `output remove`). Idle status must **not** `wpa_cli p2p_peer` the last TV — only probe while running/linkUp/live phase or a P2P GO iface exists (`attach_radio_channel_fields.should_probe_p2p_peer`).
+- **Dead sink → stop (not endless restart):** `miracast_link_watch.py` must `miracast-ctl stop` when the TV is gone but P2P/FluxCast linger — peer inactive / no stations, UDP send-error storm, or sustained TX≈0. Otherwise the UI stays on `streaming`.
+- **Demote on failures / fps sag / severe retries, not Mbps:** prefer **tx failed** / UDP / true stalls. **Video fps &lt; ~28** demotes on the **first** bad tick; **fps &lt; ~24** is severe. In the **cliff zone (≈qp≤10)**, fps&lt;29 and any tx-failed are severe (multi-step). Mild MCC retry% alone must **not** demote (only ≥~5%). Do **not** use a TX Mbps ceiling under CQP.
+- **Plugin id** is `realchrisolin.display` (GitHub fork of
+  `kris-1/omarchy-monitor-layout`; not stock `omarchy.monitor`).
+- **Archive** of the pre-fork history: `realchrisolin/omarchy-display-original`
+  (`v1-legacy` lives there).
+- **Privacy in logs / commits / public benches:** scrub SSIDs and MACs; use the sanitize helpers when publishing benchmarks.
+
+## v2 Display (`master`)
+
+This repo is a GitHub fork of kris-1/omarchy-monitor-layout (base SHA in
+`docs/UPSTREAM-monitor-layout.txt`). Contract: `docs/V2.md`.
+Bar entry is `DisplayPanel.qml` (layout + `MiracastSection.qml`). Virtual heads must stay out of Arrangement.
+Bar widgets are copied per screen; only `Quickshell.screens[0]` owns `IpcHandler` and layout apply (`singletonOwner`). QML IPC changes need `omarchy restart shell`.
+
+## Dual UI surfaces
+
+- `Panel.qml` / `Service.qml` — upstream kris-1 Display + arrangement (kept for merges; not the live bar entry).
+- `DisplayPanel.qml` — live bar widget (layout + `MiracastSection.qml`).
+- Shared layout logic: `LayoutModel.js`, `Arrangement.qml`.
+- Shared Miracast logic: `MiracastService.qml`, `Model.js`.
+
+## Where state lives
+
+| Path | Role |
+|------|------|
+| `~/.config/omarchy-miracast/settings.json` | User settings |
+| `~/.local/state/omarchy-miracast/status.json` | Live phase / radio / encode echo |
+| `~/.local/state/omarchy-miracast/p2p-csa-nofollow/` | Per P2P device MAC: sink did not follow 802.11 CSA; skip hop on next PLAY |
+| `~/.local/state/omarchy-miracast/encode.env` | FluxCast encode knobs (SIGUSR1 reload) |
+| `~/.local/state/omarchy-miracast/logs/cast.log` | FluxCast + ctl |
+| `~/.local/state/omarchy-miracast/logs/link-watch.log` | Stall / ABR / CSA |
+
+Live knob changes while streaming: `miracast-ctl set-quality` / `set-quality-effective` / `set-render-engine` → write settings + `restart-capture` (usually no full reconnect). After editing `miracast_link_watch.py`, **restart the watcher** (it does not hot-reload).
+
+## Tests
+
+Prefer targeted unit/CLI tests under `scripts/`:
+
+```bash
+python3 -m unittest scripts.test_dynamic_encode scripts.test_encode_quality_presets
+bash scripts/test_miracast_ctl_encode_cli.sh
+```
+
+Other `scripts/test_*.py` / `test_*.sh` cover radios, channel pick, persist display, etc. Run what matches the change.
+
+## Style
+
+- Match surrounding code: QML/JS like neighboring Omarchy panels; Python scripts are stdlib-first with small CLIs.
+- Comments: short and factual — non-obvious constraints only (e.g. why Very High is 5 GHz-gated), not narration of the edit.
+- User-facing copy: prefer clear labels already in the UI (`Best (High)`, `Very High`, Doctor, PRESET QUALITY). Don’t invent new jargon.
+- Do not expand scope into FluxCast or Hyprland trees unless the task requires it; this repo owns the plugin + ctl + scripts.

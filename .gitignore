@@ -1,3 +1,22 @@
-node_modules/
-*.log
+# Local / editor
+*~
+*.swp
 .DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+# Local runtime (lives under XDG on a real install)
+*.log
+.cache/
+# Private Miracast benchmark dumps (full sink name/MAC/SSIDs). Sanitize before PR:
+#   ./scripts/sanitize_benchmark_results.py
+# Built Hyprland plugins (keep icc-present-kick.so tracked for packaging)
+hyprland-plugins/**/*.so
+!hyprland-plugins/icc-present-kick/icc-present-kick.so
+hyprland-plugins/**/*.so.*
+!hyprland-plugins/icc-present-kick/icc-present-kick.so.DISABLED
+node_modules/

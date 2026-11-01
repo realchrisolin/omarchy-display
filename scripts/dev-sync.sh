@@ -1,6 +1,7 @@
 #!/bin/bash
 # Copy the working tree into the local Omarchy plugin directory and restart the
 # shell so the change is picked up (plugin hot-reload can keep stale QML cached).
+# Do not run this during a live Miracast session: it restarts omarchy-shell.
 #
 #   scripts/dev-sync.sh                 install/update and restart the shell
 #   scripts/dev-sync.sh --enable        also enable it in place of the built-in Display

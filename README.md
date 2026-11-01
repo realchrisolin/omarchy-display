@@ -1,265 +1,446 @@
-# Display with Monitor Layout for Omarchy
+# Omarchy Display + Miracast
 
-Omarchy's own **Display** widget with one addition: arrange your displays the
-way they stand on your desk by dragging them, and double-click one to see and
-change its resolution, refresh rate, scale, rotation and adaptive sync, like
-the Windows display settings. An [Omarchy](https://omarchy.org/) shell plugin.
+Fork of [kris-1/omarchy-monitor-layout](https://github.com/kris-1/omarchy-monitor-layout)
+(Omarchy Display with drag-and-drop arrangement), plus **Miracast / Wi-Fi
+Display** in the same widget.
 
-Everything else — brightness, text size, scale, turning displays on and off —
-is the unchanged built-in widget, so nothing else in your setup changes.
+Default branch is **`master`**. Plugin id is `realchrisolin.display`. Bar
+entry is `DisplayPanel.qml` (upstream `Panel.qml` is kept for merges).
+Miracast lives in `MiracastSection.qml`; layout packing is in
+`LayoutModel.js`. See [`docs/V2.md`](docs/V2.md).
 
-Hyprland places a hotplugged display wherever its rules say, and on some setups
-the result depends on the order the outputs come up. If your external monitor
-sits to the right of your laptop but the pointer has to leave through the
-*left* edge to reach it, this plugin fixes it and keeps it fixed.
+The previous Display + Miracast UI without this layout is `v1-legacy` on
+[omarchy-display-original](https://github.com/realchrisolin/omarchy-display-original).
 
-![The settings window of a display next to the Display widget with its DISPLAY SETTINGS section](preview.png)
+This is still the Display dropdown — not a separate cast icon.
+
+Cloned from first-party `omarchy.monitor`, then extended.
+
+**Local performance PoC** (custom ICC `wf-recorder`, screencopy vs ICC,
+why upstream merges matter): see **[BUILD.md](BUILD.md)**.  
+**Measured CPU / encode matrix** (charts): see **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Features
 
-- **A drop-in Display widget**: a copy of Omarchy's built-in one with a new
-  DISPLAY SETTINGS section between SCALE and DISPLAYS. Enabling the plugin puts it
-  in place of the built-in widget, and the Display shortcut
-  (`SUPER + CTRL + D`) opens it; disabling it brings the built-in one back.
-- **Drag-and-drop arrangement**, with tiles scaled to each display's logical
-  size (resolution ÷ scale, rotation aware).
-- **Any number of displays**, left to right, and **above or below** one
-  another: drag a tile onto the top or bottom part of another to stack it
-  there.
-- **Sticks across reconnects and reloads.** A background service re-applies the
-  layout when a display is plugged in or removed and after every Hyprland
-  config reload.
-- **Port independent.** Displays are remembered by their description (make,
-  model and serial), so a monitor keeps its place on any port or dock.
-- **Leaves your config alone.** `~/.config/hypr/monitors.lua` is never edited:
-  positions and the settings you keep in the properties window are applied as
-  runtime monitor rules that merge into yours. Displays are moved through a
-  staging area, so Hyprland never sees an overlapping layout.
-- **Display properties.** Double-click a tile for a window with what the
-  display reports (make, model, serial, port, size, pixel density) and its
-  resolution, refresh rate, scale, rotation and adaptive sync (VRR).
-- **Changes you can take back.** Apply tries a change right away, checks that
-  the display really took it (a refused or rounded setting is reverted at once
-  with a message) and asks *Keep these display settings?*; without an answer
-  within 30 seconds the display goes back to its previous settings, so a mode
-  it cannot show never sticks. Kept settings are remembered per display and restored after
-  reconnects and reloads.
-- **Laptop screen with an external display.** Extend, External only or
-  Mirror, like Win+P: with External only the laptop screen turns off
-  whenever an external display is connected and comes back when it is
-  unplugged.
-- **Identify.** Shows a large number and name in the corner of every screen,
-  matching the numbers on the tiles; the display being edited keeps its
-  badge while its settings window is open.
-- **Keyboard friendly.** In the DISPLAY SETTINGS section `h`/`l` choose a display,
-  `Enter` picks it up, `h`/`l` move it, `k`/`j` put it above or below,
-  `Enter` drops it, `I` opens its properties.
-
-## Requirements and dependencies
-
-- Omarchy with the Quickshell-based `omarchy-shell` and the `omarchy plugin`
-  command.
-- Hyprland with the Lua config (0.56 or newer): positions are applied with
-  `hyprctl eval`, which the legacy config parser does not support.
-- `hyprctl` and `bash`, both already present on Omarchy.
-- Omarchy's `omarchy-hyprland-monitor-internal` and
-  `omarchy-hyprland-monitor-internal-mirror` commands, for External only and
-  Mirror (shipped with Omarchy).
-
-It needs no extra packages, no elevated privileges, no system services and no
-network access. The plugin runs inside `omarchy-shell` like any other shell
-plugin.
+- Scan / connect / disconnect Miracast sinks from the Display panel
+- **Mirror** or **Extend** (Hyprland virtual output named after the sink)
+- Stream mode pills (sink-advertised CEA modes such as 720p30 / 1080p30)
+- P2P Wi‑Fi radio picker (Auto prefers idle P2P-GO adapters; optional quiet-channel CSA)
+- Safe scale / position changes (pause capture → move → restart)
+- Safer disconnect teardown (workspace migrate, cursor restore, eDP re-assert)
+- Optional VAAPI/QSV encode with OS power-plan throttling (FluxCast `power_plan_N`)
+- **Persist display across monitors** (default on): switching Miracast sinks keeps the same Extend desktop on a shared Hyprland output named `persistent-miracast`; off uses a peer-named head and seeds a fresh desktop. Empty leftover heads from earlier peer names are **not** destroyed (Hyprland `output remove` can freeze eDP); `miracast-ctl status` lists them as `orphanExtendHeads`. They clear on Hyprland restart.
+- **Start** disconnects a Wi-Fi STA already on **192.168.49.0/24** (WFD P2P subnet — phone hotspots often use it). Ethernet / docker / VPN on that range are logged and left up. **Stop** reaps leftover `fluxcast-dnsmasq` on old `p2p-wlp0s20-*` groups.
 
 ## Install
 
-```bash
-omarchy plugin add https://github.com/kris-1/omarchy-monitor-layout.git --enable
-```
+You need three pieces: this **Display** plugin, OS packages, and a **FluxCast**
+tree with the WFD patches this panel expects. The bar label stays **Display**.
 
-`--enable` swaps it in for the built-in Display widget on the bar.
-
-To update later:
+### 1. Packages
 
 ```bash
-omarchy plugin update monitor-layout
+omarchy pkg add dnsmasq wf-recorder xorg-xrandr ffmpeg
 ```
 
-## Usage
+Also needed (usually already present on Omarchy): NetworkManager, PipeWire /
+WirePlumber or PulseAudio, `iw`, `nmcli`, Python 3. Optional: `ufw` so
+**Doctor** can open Miracast ports for you.
 
-1. Open the Display widget: click its icon on the bar or press
-   `SUPER + CTRL + D`.
-2. In the DISPLAY SETTINGS section, drag a display tile to the left or right of the
-   others, the way the screens stand on your desk, and release it. To put a
-   display above or below another, drag it onto that tile's top or bottom
-   part; an accent bar shows the edge it will land on. The new layout
-   applies immediately.
-3. Or use the keyboard: `j`/`k` move to the DISPLAY SETTINGS section, `h`/`l`
-   choose a display, `Enter` picks it up, `h`/`l` move it along the row,
-   `k`/`j` put it above or below its neighbour, `Enter` drops it, `Esc`
-   closes the panel.
-4. Double-click a display tile (or press `I` on it) to open its properties.
-   Pick a resolution, refresh rate, scale, rotation or adaptive sync mode and
-   press **Apply**. Confirm with **Keep changes** within 30 seconds, or the
-   previous settings come back. `j`/`k`/`h`/`l` and `Enter` work here too;
-   `Esc` closes the window.
-5. Not sure which tile is which screen? Press **Identify** under the preview.
-6. On a laptop, choose what the laptop screen does while an external display
-   is connected: **Extend**, **External only** or **Mirror** under
-   WITH AN EXTERNAL DISPLAY.
+### 2. Install the plugin
 
-The layout and kept settings survive reconnecting a display, docking and
-reloading Hyprland.
-
-## Configure
-
-- **Bar placement**: `omarchy bar move monitor-layout --section right`
-  (`left`, `center` or `right`).
-- **Order file**: `~/.config/omarchy/monitor-layout.json` (see
-  [How it works](#how-it-works)). You can edit it by hand; the service
-  re-applies the layout when the file changes.
-
-The plugin never edits `~/.config/hypr/monitors.lua`. Settings kept in the
-properties window take precedence over it for that display; remove them from
-the display's entry in the order file to let `monitors.lua` decide again.
-Choosing a preset in the panel's SCALE section clears a kept scale for the
-focused display.
-
-## Remove
+**From git (recommended for users):**
 
 ```bash
-omarchy plugin remove monitor-layout
-rm -f ~/.config/omarchy/monitor-layout.json   # optional: forget the saved layout
-hyprctl reload                                # go back to the settings in monitors.lua
+omarchy plugin add https://github.com/realchrisolin/omarchy-display.git --enable
 ```
 
-Removing the plugin puts the built-in Display widget back on the bar.
+That clones into `~/.config/omarchy/plugins/<id>/` (id comes from
+`manifest.json`, e.g. `realchrisolin.display`), places the bar widget, and enables it.
+Disable the stock Display widget if it is still enabled:
 
-## A proposal for Omarchy
+```bash
+omarchy plugin disable omarchy.monitor
+omarchy plugin list   # expect realchrisolin.display enabled, omarchy.monitor disabled
+```
 
-Arranging displays belongs in Omarchy's own **Display** widget
-(`omarchy.monitor`), next to brightness and scale. A third-party plugin cannot
-add a section to a built-in widget, which is the only reason this plugin ships
-a whole copy of the widget.
+**From a local checkout (developers):** copy the tree into the plugin dir
+(Qt `createComponent` rejected new files through a symlink):
 
-The plugin is built so that it can be merged upstream with little effort:
+```bash
+git clone https://github.com/realchrisolin/omarchy-display.git ~/code/other/omarchy-display
+mkdir -p ~/.config/omarchy/plugins/realchrisolin.display
+rsync -a --delete --exclude .git/ ~/code/other/omarchy-display/ ~/.config/omarchy/plugins/realchrisolin.display/
 
-- `Arrangement.qml` is a self-contained section with a small API (`bar`,
-  `active`, `focused`, `cursorActive`, `panel`, `moveCursor()`, `activate()`,
-  `showProperties()`, `identify()`, `forgetSetting()`, `focusRequested`), and it brings its
-  own properties window. Dropping it between SCALE and DISPLAYS in
-  [`shell/plugins/panels/monitor/Panel.qml`](https://github.com/omacom/omarchy/blob/quattro/shell/plugins/panels/monitor/Panel.qml)
-  and adding an `"arrangement"`
-  keyboard section is about 40 lines of wiring.
-- `Service.qml` would become part of the shell's display services.
-- `LayoutModel.js` holds all layout logic as pure functions with unit tests.
+omarchy plugin validate ~/.config/omarchy/plugins/realchrisolin.display
+omarchy plugin enable realchrisolin.display --section right   # or left / center
+omarchy plugin disable omarchy.monitor
+```
 
-**Omarchy maintainers:** if you would like this in the Display widget, I am
-happy to open a pull request against
-[omacom/omarchy](https://github.com/omacom/omarchy) — let me know in an issue
-here or in the Omarchy discussions.
+Confirm `~/.config/omarchy/shell.json` bar layout references your plugin id
+(e.g. `"id": "realchrisolin.display"`), not `omarchy.monitor`. Soft-reload:
 
-## How it works
+```bash
+omarchy-shell shell rescanPlugins
+```
 
-| File | Role |
-|------|------|
-| `Panel.qml` | Omarchy's Display widget with the DISPLAY SETTINGS section added; every change is marked `arrangement`. |
-| `Model.js` | Omarchy's Display widget helpers, unchanged. |
-| `Arrangement.qml` | The DISPLAY SETTINGS section: live preview, drag-and-drop, keyboard control. Saves the order and applies it immediately. Embeddable in any panel. |
-| `MonitorProperties.qml` | The properties window opened from a tile: details, resolution, refresh rate, scale, rotation, adaptive sync; tries changes before they are kept. |
-| `KeepSettingsDialog.qml` | The modal *Keep these display settings?* countdown. |
-| `IdentifyOverlay.qml` | The Identify badges, one click-through card per screen. |
-| `Service.qml` | Always-loaded service. Re-applies the saved layout on `monitoradded`, `monitorremoved` and `configreloaded`, and when the order file changes. |
-| `LayoutApplier.qml` | Reads the layout and `hyprctl monitors -j`, restores kept settings that have drifted, then moves the displays in one `hyprctl eval` call — only when something is out of place. |
-| `LayoutModel.js` | Pure logic (sorting, positions, staging, drop target, modes, settings rules), unit tested with Node. |
+QML icon/layout changes sometimes need a full shell restart:
 
-The layout lives in `~/.config/omarchy/monitor-layout.json`:
+```bash
+rm -rf ~/.cache/quickshell/qmlcache
+omarchy restart shell
+```
+
+### 3. FluxCast
+
+Point Miracast at a FluxCast **source tree** (not an AppImage alone). Prefer a
+fork that already includes the Omarchy WFD work (encode.env reload, LPCM,
+pipe/DMA-BUF, SIGUSR1 restart), e.g.
+[realchrisolin/fluxcast](https://github.com/realchrisolin/fluxcast)
+`feat/wfd-hw-encode-modes`, or apply `patches/fluxcast/` onto upstream
+[IlyaP358/fluxcast](https://github.com/IlyaP358/fluxcast) — see
+[`patches/fluxcast/APPLY.md`](patches/fluxcast/APPLY.md).
+
+```bash
+git clone https://github.com/realchrisolin/fluxcast.git ~/code/other/fluxcast
+cd ~/code/other/fluxcast && git checkout feat/wfd-hw-encode-modes   # if using that fork
+```
+
+`miracast-ctl` resolves FluxCast in this order:
+
+1. `$FLUXCAST_ROOT` (environment)
+2. `fluxcastRoot` in `~/.config/omarchy-miracast/settings.json` (`~/…` or `$HOME/…` OK)
+3. Sibling `../fluxcast` next to this plugin checkout (e.g. `~/code/other/fluxcast` beside `~/code/other/omarchy-display`)
+
+```bash
+# Portable — prefer $HOME, not a hard-coded /home/<user>/…
+export FLUXCAST_ROOT="${FLUXCAST_ROOT:-$HOME/code/other/fluxcast}"
+# Or persist:
+#   { "fluxcastRoot": "$HOME/code/other/fluxcast" }  in settings.json
+```
+
+If an old AppImage extract still lives under
+`vendor/squashfs-root/usr/src/fluxcast`, replace that directory with a
+**symlink** to the git checkout so paths cannot drift.
+
+### 4. Optional: `miracast-ctl` on PATH
+
+The panel always runs `pluginDir/bin/miracast-ctl`. For a terminal:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sfn ~/.config/omarchy/plugins/realchrisolin.display/bin/miracast-ctl ~/.local/bin/miracast-ctl
+# ~/.local/bin is usually already on PATH on Omarchy
+miracast-ctl status
+miracast-ctl doctor
+```
+
+### 5. Smoke-check
+
+```bash
+miracast-ctl doctor          # or: Doctor in the Display panel
+miracast-ctl scan            # nearby Miracast sinks
+```
+
+Put the TV/dongle in Miracast / screen-mirroring receive mode, then **Scan** and
+connect from the Display panel. Day-to-day tips (audio, channels, 2.4-only
+dongles): panel **Info**, or [`docs/MIRACAST-HELP.md`](docs/MIRACAST-HELP.md).
+
+**Hardware note:** some Miracast sticks **listen** on 2.4 GHz but still accept a
+**5 GHz operating channel** (hotyeah / Realtek 8192CU often: `listen_freq=2437`,
+`oper_freq=5220`). Status uses `p2pFreqSource=peer_oper` in that case — do not
+treat listen as air. True **2.4-only** sinks (oper stays on 2.4 while STA is
+5 GHz) force MCC; Doctor warns as `radio_mcc`. On true 5 GHz SCC with HT20 P2P
+next to a wider STA, Doctor may warn `radio_scc_tax` (one-radio airtime); set
+`p2pWifiInterface` to a second idle NIC when available.
+
+## Settings
+
+`status` JSON includes live radio fields (no SSIDs): `staChannel`, `p2pChannel`,
+`staWidthMHz`, `p2pRole`, `radioMcc`, `p2pFreqSource` (`peer_oper` /
+`peer_listen`), `p2pListenFreqMHz` / `p2pOperFreqMHz`.
+
+Override in `~/.config/omarchy-miracast/settings.json` (merged with
+`miracast-ctl` defaults on read):
+
+| Key | Default | Notes |
+|-----|---------|--------|
+| `mode` | `mirror` | `mirror` or `extend` |
+| `extendPosition` | `right` | `left` / `right` / `above` / `below` |
+| `streamMode` | `1280x720p30` | e.g. `1920x1080p30` — drives fps + resolution |
+| `fps` | `20` | Fallback when `streamMode` is unset |
+| `outputRes` | `1280x720` | Encoded size (fallback) |
+| `extendResolution` | `1280x720` | Extend virtual output size (fallback) |
+| `extendRefresh` | stream fps (clamped to advertised HEADLESS modes, typically **60**) | Virtual output Hz. Hyprland HEADLESS often lists only 60 Hz — do not invent 30 Hz (ICC stalls, ffmpeg IO watchdog rebinds). `scripts/headless_refresh.py` picks the live RTSP fps when advertised. |
+| `bitrate` | `8M` | Current encode target. Under `encodeStrategy=smartview` ABR uses Samsung dig **2–14 Mbps** (init **8M**). Interactive kenya/hotyeah profile uses **CBR** (AOSP `OMX_Video_ControlRateConstant`); QVBR on Intel undershoots (~0.2 Mbps) and turns a 0.25 s VBV into seconds of lag. |
+| `videoEncoder` | `auto` | `auto` → VAAPI, else NVENC, else QSV, else `libx264` |
+| *(env)* `FLUXCAST_WFD_CAPTURE_ENCODE` | `auto` (Omarchy) / `pipe` (upstream) | `auto`/`vaapi` = wf-recorder DMA-BUF encode (incl. scaled outputs); `pipe` = raw→ffmpeg hwupload |
+| *(env)* `FLUXCAST_WFD_DMABUF_ALLOW_SCALED` | allow (default) | `0`/`false` = force pipe when Hyprland scale ≠ 1 |
+| `encodeStrategy` | `smartview` | `smartview` = DMA-BUF + BitrateController (Samsung 2/8/14M, qmin/qmax 15–44). **CBR** is the interactive RC (AOSP Converter.cpp); QVBR remains available if `vaapiRcMode` is set. `performance` = DMA-BUF CQP. |
+| `captureEncode` | `dmabuf` | RENDER ENGINE: `dmabuf` (GPU + DMA-BUF) / `vaapi` (GPU pipe) / `cpu` |
+| `audioEnabled` | `true` | PipeWire/Pulse **Miracast** null sink; FluxCast captures **`miracast.monitor`**. If the sink lists LPCM, FluxCast muxes WFD **`stream_type=0x83`** (hotyeah / many Realtek dongles are LPCM-only — AAC is silent). AAC only when LPCM is absent or `FLUXCAST_WFD_FORCE_AAC=1`. Do **not** use ffmpeg `aresample=async` (held ~0.5 s). Keep the Miracast sink near **100%**. See [BUILD.md §6](BUILD.md). |
+| `autoSwitchAudioOutput` | `true` | Panel: **Automatically switch audio output**. On: default sink → Miracast at PLAY (speakers held during connect). Off: leave the currently selected output; still create the Miracast sink for manual routing / capture. |
+| `softwareCursors` | `true` | Force SW cursors so the pointer appears on the TV (HW cursor plane is not captured). |
+| `wfRecorderBin` | unset | Absolute path to a custom `wf-recorder`. **Required for QVBR target hit** (build with `rc_min_rate` apply). Empty = PATH stock (undershoots QVBR to ~3 Mbps). ICC/PR #347 optional for capture pacing; see [BUILD.md §7](BUILD.md). |
+| `wfRecorderProto` | `auto` | `auto` / `icc` / `wlr`. `auto` upgrades to `icc` when a configured binary advertises ICC. Use `wlr` + stock binary if cast-head terminal keys feel buffered until the pointer moves. |
+| `wfRecorderDamage` | `"1"` | `"1"` = damage-aware (omit `wf-recorder -D`); `"0"` = continuous `-D`. Set by `scripts/recommend-cast-profile.py --apply` or manually. |
+| `captureEncode` | `dmabuf` | Render engine: `dmabuf` \| `vaapi` (GPU pipe) \| `cpu`. |
+| `encodeProfile` | `medium` | Quality: **best\|veryhigh\|high\|medium\|low** — knobs **per engine** (`scripts/encode_quality_presets.py`). |
+| `castPreset` | `desktop` | Content hint: `desktop` = damage-aware; `movie` = continuous `-D`. |
+| `vaapiQuality` | *(from profile)* | ffmpeg `h264_vaapi` `-quality` (1–8; higher = faster/worse). |
+| `vbvMultiplier` | `0.25` (CBR) / `0.1` cap (QVBR) | CBR: Intel low-delay HRD **0.25 s** of target (smaller pumped quality on iHD). QVBR: cap seconds; FluxCast sizes `bufsize` from ~4 frames so undershoot cannot turn `peak×0.25` into many seconds. → `FLUXCAST_WFD_VBV_MULTIPLIER`. |
+| `p2pWifiInterface` | `auto` | Managed Wi‑Fi iface for Miracast P2P, or `auto` (prefer **idle** P2P-GO NIC so Miracast is not time-sliced with home STA). USB names change on re-plug; a missing saved iface is resolved to a live radio of the same role, not kept as a stale name. |
+| `p2pGo5GHz` | `false` | USB GO only: keep 5 GHz in the GO channel set. Default drops 5 GHz (`p2p_no_go_freq`). After PLAY, FluxCast may 802.11-CSA to 2.4 if the phy cannot carry 5 GHz WFD; a sink that does not follow is remembered (`p2p-csa-nofollow`) and the hop is skipped next time. Ignored on NetworkManager ifaces. |
+| `usbWpaSupplicant` | *(empty)* | Absolute path to `wpa_supplicant` for dedicated USB P2P. Empty = `PATH`. Also `FLUXCAST_USB_WPA`. |
+| `p2pQuietCsa` | `false` | `true` = post-PLAY CSA to a quiet channel (MCC). Default **SCC**. |
+| `vaapiRcMode` | *(from profile)* | `CQP` / `QVBR` / `CBR` / `VBR` → `FLUXCAST_WFD_VAAPI_RC`. |
+| `vaapiBitrate` | *(from profile)* | QVBR/CBR peak (`FLUXCAST_WFD_VAAPI_BITRATE`). |
+| `vaapiQp` | *(from profile)* | Quantizer (lower = sharper). |
+| `vaapiGop` | `60` at 1080p60 | GOP frames (~1 s IDR). wf-recorder applies this on `AVCodecContext.gop_size` (`-p gop_size` is not a VAAPI private option). GOP 15 emptied a 0.25 s HRD four times a second. |
+| `vaapiAsyncDepth` | `2` | Pipe `async_depth` (from profile). |
+| `sinkScales` | `{}` | Per-sink Extend scale, keyed by MAC (overrides default) |
+| `defaultExtendScale` | `1` | Extend scale when a sink has no `sinkScales` entry — **1** is cheapest for Hyprland |
+| `onlyExpandFocusedDisplay` | `true` | Display panel accordion: only the **focused** output expands nested controls |
+
+### Display panel expansion
+
+By default every enabled display row is expanded (Brightness / Scale / cast
+controls). To restore single-row accordion behavior:
 
 ```json
-{
-  "order": [
-    "Lenovo Group Limited 0x8AB1",
-    "AOC U34V5C XYZ1234567890"
-  ],
-  "monitors": {
-    "AOC U34V5C XYZ1234567890": { "mode": "3440x1440@99.98", "scale": 1, "vrr": 1 }
-  }
-}
+"onlyExpandFocusedDisplay": true
 ```
 
-`monitors` holds the settings kept in the properties window, per display:
-`mode` (`WIDTHxHEIGHT@HZ`), `scale`, `transform` (0–3 rotate by 0°, 90°,
-180°, 270°) and `vrr` (0 off, 1 on, 2 fullscreen only). Every field is
-optional.
+While connected, **WITH A MIRACAST DISPLAY** (under **WITH AN EXTERNAL DISPLAY**)
+has Extend / Mirror. Place the Extend head on the **ARRANGEMENT** canvas (drag
+the wifi tile left or right of the laptop; **h**/**l** with that tile selected).
+Double-click the wifi tile for scale/rotation plus stream/encode/radio.
+The **MIRACAST** row is a single line (summary + Scan / Doctor / Info / Start-Stop).
+Only the focused
+display row expands nested brightness/scale/cast controls.
 
-`stack` lists displays standing above or below another one, centered on
-it: `{ "<display>": { "on": "<display below or above>", "side": "above" } }`.
+### RENDER ENGINE
 
-`withExternal` is `external-only` or `mirror` when chosen under WITH AN
-EXTERNAL DISPLAY (absent means `extend`). The service carries it out with
-Omarchy's `omarchy-hyprland-monitor-internal off` and
-`omarchy-hyprland-monitor-internal-mirror on`, the same commands as Omarchy's
-own laptop-display toggles.
+Shown only after the Miracast display exists (connected session). Default is
+**GPU + DMA-BUF**. Pills (two lines — title + card-reported GPU name):
 
-Entries may be monitor descriptions or output names (`eDP-1`, `HDMI-A-1`).
-Displays that are not listed are placed to the right, in their current order.
-Displays that are listed but unplugged are remembered for next time.
-
-Positions are computed left to right, top-aligned, with no gaps, using each
-display's logical size; stacked displays are centered above or below theirs,
-and the whole layout is shifted to start at `0x0`. Disabled and mirrored
-outputs are skipped.
-
-## Limitations
-
-- A display above or below another is always centered on it; other
-  offsets are not supported yet.
-- After a Hyprland config reload the positions from `monitors.lua` apply for a
-  moment (about 300 ms) before the service restores the saved layout.
-- `Panel.qml` is a copy of Omarchy's Display widget; it is kept in sync with
-  upstream by hand, so a new upstream feature may arrive here a little later.
-
-## Development
-
-From a working copy of this repository:
+| Pill | `captureEncode` | Path |
+|------|-----------------|------|
+| GPU + DMA-BUF | `dmabuf` | `wf-recorder` DMA-BUF encode when VAAPI DMA works; else falls back to GPU pipe → CPU |
+| GPU | `vaapi` | Hardware pipe: VAAPI / NVENC / QSV as probed |
+| CPU | `cpu` | raw pipe → `libx264` |
 
 ```bash
-scripts/check.sh                # unit tests + manifest validation
-scripts/dev-sync.sh --enable    # copy into ~/.config/omarchy/plugins, swap in for Display, restart the shell
+miracast-ctl set-render-engine dmabuf|vaapi|cpu
+# aliases: gpu-dmabuf | gpu | cpu
+miracast-ctl gpu-info   # JSON: card-reported deviceName, vendor, dmabufLikely, …
 ```
 
-If you keep your own Display clone, `scripts/dev-sync.sh --service-only`
-installs just the layout service, without the widget.
+Preference is stored in `settings.json` and `$XDG_STATE_HOME/omarchy-miracast/capture-encode`.
+Changing engine **retargets** the current **QUALITY** tier (same label, different
+knobs). Live knob changes while streaming usually apply via `restart-capture`
+(SIGUSR1). If a GPU path fails, FluxCast falls back toward CPU; the **active**
+pill follows the resolved path (`capturePath` / `encoder` in status).
 
-`scripts/dev-sync.sh` restarts `omarchy-shell` because the plugin hot-reload
-can keep a stale copy of the QML cached. `scripts/check.sh` also runs
-`qmllint` when it is available (only syntax errors fail; warnings about the
-shell's `qs.*` modules are expected outside `omarchy-shell`).
+### Interactive encode (WFD)
 
-Before a release, test by hand:
+Aligned with [Wi-Fi Display](https://www.wi-fi.org/system/files/Miracast_Specification_v2.3.pdf)
+§4.10.3 (adapt bitrate to the P2P link), [MS-WFDPE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wfdpe/9ac9b0a4-0a94-483d-a8bf-cd7bfea99be0)
+interactive latency, and AOSP `Converter.cpp` (**CBR**, ~1 s IDR).
 
-- open and close the panel by click, `Esc`, `SUPER + CTRL + D` and
-  `omarchy-shell omarchy.monitor open` / `close`;
-- brightness, text size, scale and display toggles still work;
-- drag a display to each side and check `hyprctl monitors`;
-- open a display's properties, apply a change, then let it revert, revert it
-  and keep it; check `monitor-layout.json` and that `hyprctl reload` restores
-  the kept settings;
-- `hyprctl reload`, unplug and replug a display: the layout comes back;
-- `omarchy plugin disable monitor-layout` (the built-in Display comes back),
-  `enable`, `omarchy restart shell`, and finally
-  `omarchy plugin remove monitor-layout`.
+| Knob | Interactive profile (kenya / hotyeah) | Why |
+|------|----------------------------------------|-----|
+| RC | **CBR** (`h264_vaapi`) | AOSP CBR. Intel QVBR undershoots (~0.2 Mbps) so a 3.5 Mbit VBV becomes seconds of lag. |
+| HRD | **0.25 s** of target (`bufsize ≈ bitrate/4`) | Intel low-delay AVC. 0.1 s pumped quality on iHD. |
+| GOP | **60** at 1080p60 | AOSP-style 1 s IDR. wf-recorder must set `AVCodecContext.gop_size` or Intel uses ~2 s. |
+| `i_qfactor` | **1.0** | IDR same quantizer as P (no “refresh” flash). |
+| AU delimiter | `aud=1` | Helps MPEG-TS access-unit framing. |
+| Mux | DMA encode + ffmpeg **copy**; **no `aresample=async`** | That filter held ~0.5 s. |
+| Audio | **LPCM `0x83`** if the sink lists LPCM; else AAC | WFD + AOSP LPCM PES. LPCM-only dongles ignore AAC. |
+| HEADLESS Hz | Match negotiated fps; clamp to advertised modes (**60** typical) | 30 Hz on a 60 Hz-only head stalls ICC. |
+| DMA freeze recovery | `encode stall` stderr (~4 s) + LPCM `wchar` IO watchdog (~8 s) | ICC DMA can stall after a window move; rchar stays flat so the watchdog watches wchar. |
 
-Useful while developing:
+Layout: packer includes the Miracast tile. Connect slides physical monitors off the packed origin before creating the head, and will not place `persistent-miracast` on top of eDP — that is Hyprland's **monitor layout overlaps** warning (cursor on both outputs). `place-virtual-head` on **x,y-only** does not SIGUSR1 capture (`wf-recorder -o` follows the output name). Do not `miracast-ctl stop`/`start` to tweak encode (that modesets the virtual head; on kenya it has corrupted eDP). Use `restart-capture` or a user-requested reconnect.
+
+### PRESET QUALITY
+
+Independent of render engine: **Best (Dynamic)** / **Very High** / **High** /
+**Medium** / **Low**. Knobs are per engine in `scripts/encode_quality_presets.py`
+(DMA-BUF high ≠ GPU-pipe high). Open the wifi tile **properties** (double-click or **I**).
 
 ```bash
-omarchy-shell omarchy.monitor open   # open the Display panel
-hyprctl monitors -j | jq '.[] | {name, description, x, y, width, height, scale}'
-cat ~/.config/omarchy/monitor-layout.json
+miracast-ctl set-quality best|veryhigh|high|medium|low
+miracast-ctl set-quality-effective step:N   # Best fine-step only
 ```
 
-Shell logs are in `/run/user/$UID/quickshell/by-id/*/log.log`.
+`castPreset` (`desktop` / `movie`) only toggles damage-aware vs continuous `-D`.
+
+**Capture cadence:** Miracast Extend defaults to **damage-aware** capture
+(omit `wf-recorder -D`) so Hyprland only produces frames when the output
+changes — lower CPU, cursor still smooth. Force continuous grab with
+`FLUXCAST_WFD_WF_RECORDER_DAMAGE=0`.
+
+**Optional ICC wf-recorder (PR #347):** not required. Default is the distro
+`wf-recorder` on `PATH` (wlr-screencopy). To opt into a local ICC build until
+upstream ships it, set an absolute path explicitly:
+
+```json
+"wfRecorderBin": "/usr/local/bin/wf-recorder-icc",
+"wfRecorderProto": "auto"
+```
+
+Or export `FLUXCAST_WFD_WF_RECORDER_BIN` / `FLUXCAST_WFD_WF_RECORDER_PROTO`
+before connect. Env wins over settings. There is **no** automatic probing of
+`~/src/...` build trees. If `wfRecorderProto` is `icc` but the binary is missing
+or not ICC-capable, Miracast falls back to PATH stock and logs a warning.
+See FluxCast `DOCUMENTATION.md`.
+
+To score [BENCHMARKS.md](BENCHMARKS.md) results into settings (`captureEncode`,
+`wfRecorderBin` / `Proto` / `Damage`, `videoEncoder`):
+
+```bash
+./scripts/recommend-cast-profile.py          # dry-run + docs/benchmarks/recommended.env
+./scripts/recommend-cast-profile.py --apply  # update settings.json
+miracast-ctl set-render-engine dmabuf|vaapi|cpu   # RENDER ENGINE (alias: set-capture-encode)
+miracast-ctl set-quality high|medium|low          # QUALITY tier per engine (alias: set-encode-profile)
+miracast-ctl set-cast-preset movie|desktop        # damage-aware vs continuous -D
+miracast-ctl benchmark all                        # live matrix: every engine × every QUALITY tier
+miracast-ctl benchmark --engines dmabuf,vaapi --tiers high,medium
+# If already casting, matrix mode counts down 10s (Ctrl+C cancels; -y skips)
+```
+
+See [BENCHMARKS.md](BENCHMARKS.md) for presets and Intel CBR undershoot notes.
+FluxCast auto-rebinds capture on buffer-pool / DTS spikes (RTSP stays up).
+
+While connected, Hyprland **animations** are turned off and restored on stop.
+Borders/gaps stay on so focus rings and the workspace indicator keep working.
+Software cursors stay on (required for a visible pointer in screencopy).
+
+**Extend scale:** default is `1` (`defaultExtendScale`) for lower Hyprland cost;
+override per sink in the Display panel (`sinkScales`).
+
+```bash
+miracast-ctl benchmark                      # probes + live sample if streaming
+miracast-ctl benchmark --offline-only       # capability-only (no live sample)
+miracast-ctl benchmark --apply              # write settings.json + recommended-cast.env
+miracast-ctl set-render-engine dmabuf|vaapi|cpu
+miracast-ctl list-p2p-radios                # Auto / iface + P2P-GO / STA flags
+miracast-ctl set-p2p-wifi-interface auto|IFACE
+miracast-ctl pick-channel                   # scored quiet/quietest (default 5 GHz)
+miracast-ctl pick-channel --band 2.4 --json
+./scripts/bench_p2p_channel.sh              # SCC vs MCC TX A/B
+```
+
+`benchmark` probes VAAPI/`wf-recorder` support and P2P-GO radios, merges
+`docs/benchmarks/results.tsv` when present, and — if a cast is already
+streaming — runs a ~25s live TX/retry/CPU sample to refine the advice.
+Use `--offline-only` to skip the live sample. `--apply` writes settings
+(once per machine, or after adding a USB Wi‑Fi dongle).
+
+### P2P channel (SCC vs quiet CSA)
+
+By default Miracast uses **SCC**: force the P2P GO onto the **STA primary
+channel** (`p2p_ignore_shared_freq=0`, `--wfd-p2p-channel=<STA>`), and after
+PLAY align with CSA if negotiation landed elsewhere. Set `p2pQuietCsa: true`
+(or `MIRACAST_P2P_QUIET_CSA=1`) to CSA onto a quieter channel instead (MCC).
+If STA is 5 GHz but the sink’s **operating** channel stays on 2.4, cross-band
+CSA is skipped and a quieter **2.4** channel is used instead. Some 8192CU-class
+dongles still accept **5 GHz `oper_freq`** even when `listen_freq` is 2.4 —
+verify with `./scripts/verify_p2p_air_band.py` (`p2pFreqSource=peer_oper`).
+True 2.4-only oper → **MCC** (STA 5 GHz + P2P 2.4): known Miracast quality tax
+(Microsoft eCSA / ScreenBeam “DCM”); expect occasional glitches. Mitigate with
+quiet-channel pick + bitrate headroom, or a dual-band sink / second Wi‑Fi NIC.
+
+**How “quiet” channel picking works** (`scripts/pick-p2p-channel.py`): the
+label *quiet* is only a score threshold (default ≤ 5). What actually ranks
+channels is a numeric **interference score** (lower is better): visible APs
+from `nmcli` add cost on their channel and bleed into neighbors; stronger APs
+cost more. When nothing is under the threshold (typical on 2.4 GHz), the
+picker chooses the **lowest score** (“quietest”). That ranking is what
+matters — and it has matched real Miracast **TX retry** rates on-device
+(2026-09-15, AX201 + 2.4-only dongle: among `{1,6,11}`, ch 11 best / fewest
+retries, ch 1 worst because the home 2.4 AP and strong adjacent BSS sit
+there). Inspect scores with:
+
+```bash
+./scripts/pick-p2p-channel.py --json --band 2.4
+miracast-ctl pick-channel
+```
+
+Developer wiring (CSA commands, tests) lives in [BUILD.md](BUILD.md) § P2P
+channel.
+
+**While streaming**, `scripts/miracast_link_watch.py` (started after PLAY) watches
+the link cheaply: sysfs TX bytes every ~8s, `iw station dump` every few ticks,
+and a **cached** `nmcli wifi list` score at most every ~3 minutes and only after
+sustained high retries / IDR bursts (sink `wfd_idr_request` ≥2/tick is
+decoder stall → QVBR drop, not iw-retry LOSS). Stall (TX &lt; ~3 Mbps for ~24s — often a
+wedged VAAPI pipe) → `restart-capture`. A clearly better 2.4 GHz score can CSA
+(5 min cooldown, max 2/hour, score margin). No forced Wi‑Fi rescans on the hot
+path.
+
+## Virtual output lifecycle (eDP safety)
+
+Miracast **must not** call `hyprctl output remove` / `monitor,disable` during
+connect or disconnect — those calls have frozen the primary display for
+30–90s. Stop leaves the virtual output in place (`persistent-miracast`, often
+parked at `-12000x0`); the next Extend session **reuses** it. Orphan cleanup
+is never automatic on the hot path. Heads clear on Hyprland restart.
+
+**Disconnected session cleanup.** When nothing is casting and no P2P group is
+up, `miracast-ctl status` reconciles: stale `error`/connecting → `idle`, reap
+watchers, drop parked-tracking files if the head is already gone, and re-park
+an on-layout idle Extend head off-layout. It does **not** destroy the head.
+Idle polls also skip `wpa_cli p2p_peer` for `lastPeerMac` so a dead sink does
+not keep privileged Wi‑Fi probes forever.
+
+**Hardware cursor plane.** Keep `cursor:no_hardware_cursors=true` while any
+virtual head exists (live or parked). Restoring the HW cursor plane in the
+same window as an eDP modeset has hard-locked i915 (no VT, caps-lock LED
+stuck). `miracast-ctl` already holds software cursors for that lifetime; do
+not toggle the option by hand to “fix” a missing pointer.
+
+**Inactive VT / DRM master.** Hyprland on TTY1 does not own DRM while another
+VT is active. `hyprctl dispatch` / `eval` that touches cursor, renderer, or
+outputs (`force_renderer_reload`, `omarchy restart shell`, focus/warp onto
+eDP, `no_hardware_cursors` changes) queues KMS work that applies when the
+session regains master. Switching back (`Ctrl+Alt+F1`) has hard-locked i915
+the same way — CPU may keep running; display and input die; there is often
+no `GPU hang` printk. On kenya, short power is ignored
+(`HandlePowerKey=ignore`); hold the power key.
+
+**Lost laptop pointer** with a parked head is usually the cursor on that
+head (check `hyprctl -j cursorpos` / focused monitor), not a hung eDP panel.
+`warp_on_change_workspace=1` focusing `ext-*` is enough to put it there.
+
+**Recovery**
+
+| Situation | Do | Do not |
+|-----------|----|--------|
+| Still on the graphical session, pointer on the parked head | `hyprctl` focus/cursor warp onto eDP only | `output remove`, `monitor,disable`, `force_renderer_reload`, bounce `no_hardware_cursors`, `omarchy restart shell` |
+| Already on another VT (TTY2, …) | Leave Hyprland alone. Reboot if you need the laptop. | Any of the above, then `Ctrl+Alt+F1` back |
+
+Read-only `hyprctl monitors` / `cursorpos` / `layers` is fine from any VT.
+
+## Cast modes
+
+| Mode | Behavior |
+|------|----------|
+| **Mirror** | Captures the current desktop monitor |
+| **Extend** | Creates a Hyprland virtual output beside the laptop and casts that |
+
+## Shortcuts (Display panel)
+
+| Key | Action |
+|-----|--------|
+| S | Scan sinks |
+| D | Doctor (diagnose; open UFW ports if needed) |
+| I | Miracast help (themed card; CLI uses terminal) |
+| C | Connect last device / reconnect |
+| X | Stop cast |
+| M | Mirror mode |
+| E | Extend mode |
 
 ## License
 
-[MIT](LICENSE). `Panel.qml` and `Model.js` come from Omarchy, also MIT — see
-[NOTICE](NOTICE).
+MIT — see [LICENSE](LICENSE).
