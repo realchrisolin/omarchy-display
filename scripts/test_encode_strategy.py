@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Unit tests for encode_strategy.py."""
+
+from __future__ import annotations
+
+import importlib.util
+import unittest
+from pathlib import Path
+
+_path = Path(__file__).resolve().parent / "encode_strategy.py"
+_spec = importlib.util.spec_from_file_location("encode_strategy", _path)
+assert _spec and _spec.loader
+es = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(es)
+
+
+class EncodeStrategyTest(unittest.TestCase):
+    def test_smartview_defaults_dmabuf_cbr(self):
+        s: dict = {"encodeProfile": "best"}
+        out = es.apply_to_settings(s, "smartview")
+        self.assertEqual(out["encodeStrategy"], "smartview")
+        self.assertEqual(s["captureEncode"], "dmabuf")
+        self.assertEqual(s["vaapiRcMode"], "CBR")
+        self.assertEqual(s["encodeStrategyAbr"], "sv")
+        self.assertEqual(s["bitrate"], "14M")
+        self.assertEqual(s["vaapiBitrate"], "14M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
+        self.assertEqual(s["vbvMultiplier"], "0.25")
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
+        self.assertTrue(es.uses_sv_abr(s))
+
+    def test_latency_first_vbv_from_bitrate_and_air(self):
+        self.assertEqual(es.latency_first_vbv_multiplier(2.4), 0.25)
+        self.assertEqual(es.latency_first_vbv_multiplier(8.0), 0.25)
+        self.assertEqual(es.latency_first_vbv_multiplier(2.4, air_mbps=30.0), 0.25)
+        self.assertEqual(es.latency_first_vbv_multiplier(8.0, air_mbps=10.0), 0.5)
+        self.assertEqual(es.latency_first_vbv_multiplier(1.0), 0.5)
+
+    def test_smartview_keeps_existing_bitrate(self):
+        s: dict = {"encodeProfile": "best", "bitrate": "14M", "vaapiBitrate": "14M", "encodeWfdBitrateMbps": 14.0}
+        s["vaapiIQfactor"] = "1.3"
+        es.apply_to_settings(s, "smartview")
+        self.assertEqual(s["bitrate"], "14M")
+        self.assertEqual(s["vaapiBitrate"], "14M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
+
+    def test_performance_forces_cqp_dmabuf(self):
+        s = {
+            "encodeProfile": "best",
+            "vaapiRcMode": "QVBR",
+            "encodeWfdBitrateMbps": 45,
+            "encodeCongestionBitrateMbps": 45,
+        }
+        es.apply_to_settings(s, "performance")
+        self.assertEqual(s["vaapiRcMode"], "CQP")
+        self.assertEqual(s["captureEncode"], "dmabuf")
+        self.assertEqual(s["encodeStrategyAbr"], "cqp_ladder")
+        self.assertNotIn("encodeWfdBitrateMbps", s)
+        self.assertFalse(es.uses_sv_abr(s))
+
+    def test_retarget_engine_false_keeps_engine(self):
+        s = {
+            "captureEncode": "vaapi",
+            "encodeProfile": "best",
+        }
+        es.apply_to_settings(s, "smartview", retarget_engine=False)
+        self.assertEqual(s["captureEncode"], "vaapi")
+        self.assertFalse(s["encodeStrategyPinnedEngine"])
+
+    def test_prepare_dmabuf_settings_clears_fallback(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyFallback": "pipe",
+            "captureEncode": "vaapi",
+            "encodeProfile": "best",
+        }
+        out = es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["encodeStrategyFallback"], "")
+        self.assertEqual(s["captureEncode"], "dmabuf")
+        self.assertEqual(out["captureEncode"], "dmabuf")
+        self.assertEqual(s["vaapiRcMode"], "CBR")
+        self.assertEqual(s["bitrate"], "14M")
+        self.assertEqual(s["encodeWfdBitrateMbps"], 14.0)
+        self.assertEqual(s["vaapiGop"], 60)
+        self.assertEqual(s["vbvMultiplier"], "0.25")
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
+
+    def test_prepare_clears_cqp_high_iqfactor_when_pinned(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": True,
+            "captureEncode": "dmabuf",
+            "vaapiIQfactor": "1.3",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiIQfactor"], "1.0")
+        self.assertEqual(s["captureEncode"], "dmabuf")
+
+    def test_prepare_preserves_cbr(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": True,
+            "captureEncode": "dmabuf",
+            "vaapiRcMode": "CBR",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiRcMode"], "CBR")
+        self.assertEqual(s["captureEncode"], "dmabuf")
+
+    def test_prepare_cbr_keeps_one_second_gop(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": False,
+            "vaapiRcMode": "CBR",
+            "vaapiGop": 60,
+            "streamMode": "1920x1080p60",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiGop"], 60)
+        self.assertEqual(s["vbvMultiplier"], "0.25")
+
+    def test_prepare_cbr_migrates_short_gop_to_one_second(self):
+        s = {
+            "encodeStrategy": "smartview",
+            "encodeStrategyPinnedEngine": False,
+            "vaapiRcMode": "CBR",
+            "vaapiGop": 15,
+            "streamMode": "1920x1080p60",
+        }
+        es.prepare_dmabuf_settings(s)
+        self.assertEqual(s["vaapiGop"], 60)
+
+    def test_starve_detector_triggers_after_streak(self):
+        streak = 0
+        for _ in range(es.STARVE_TICKS - 1):
+            hit, streak, reason = es.dmabuf_qvbr_starving(
+                capture_path="dmabuf",
+                rc_mode="QVBR",
+                strategy="smartview",
+                air_tx_mbps=1.0,
+                target_mbps=45.0,
+                video_fps=60.0,
+                streak=streak,
+            )
+            self.assertFalse(hit)
+            self.assertIn("streak", reason)
+        hit, streak, reason = es.dmabuf_qvbr_starving(
+            capture_path="dmabuf",
+            rc_mode="QVBR",
+            strategy="smartview",
+            air_tx_mbps=1.0,
+            target_mbps=45.0,
+            video_fps=60.0,
+            streak=streak,
+        )
+        self.assertTrue(hit)
+        self.assertIn("starve", reason)
+
+    def test_quiet_qvbr_not_starving(self):
+        # Healthy QVBR on quiet UI ~4–8 Mbps must not trip fallback.
+        hit, streak, reason = es.dmabuf_qvbr_starving(
+            capture_path="dmabuf",
+            rc_mode="QVBR",
+            strategy="smartview",
+            air_tx_mbps=6.0,
+            target_mbps=45.0,
+            video_fps=60.0,
+            streak=2,
+        )
+        self.assertFalse(hit)
+        self.assertEqual(streak, 0)
+        self.assertEqual(reason, "ok")
+
+    def test_starve_inactive_on_performance_or_pipe(self):
+        hit, streak, _ = es.dmabuf_qvbr_starving(
+            capture_path="pipe",
+            rc_mode="QVBR",
+            strategy="smartview",
+            air_tx_mbps=1.0,
+            target_mbps=45.0,
+            video_fps=60.0,
+            streak=2,
+        )
+        self.assertFalse(hit)
+        self.assertEqual(streak, 0)
+        hit, streak, _ = es.dmabuf_qvbr_starving(
+            capture_path="dmabuf",
+            rc_mode="CQP",
+            strategy="performance",
+            air_tx_mbps=1.0,
+            target_mbps=45.0,
+            video_fps=60.0,
+            streak=2,
+        )
+        self.assertFalse(hit)
+
+
+if __name__ == "__main__":
+    unittest.main()

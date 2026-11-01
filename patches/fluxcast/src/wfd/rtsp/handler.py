@@ -1,0 +1,922 @@
+import os
+import random
+import socketserver
+import threading
+import time
+from dataclasses import replace
+from typing import Optional
+
+from ..config import WFDCEAMode, WFDMediaConfig, WFDNotReady, WFDVideoFormat
+from ..constants import WFD_AUDIO_AAC, WFD_AUDIO_LPCM_48K, WFD_UIBC_PORT
+from ..dump import schedule_ts_dump_report
+from ..encoding import (
+    _bitrate_to_kbits,
+    _parse_resolution,
+    link_allows_lpcm,
+    read_go_air_mbps,
+    read_go_oper_mhz,
+    read_go_radio_can_5ghz,
+    should_honor_idr_request,
+)
+from ..latency import _append_latency_log
+from ..media.pipeline import WFDMediaPipeline
+from ..mode_state import write_mode_state
+from ..modes import (
+    _choose_cea_mode,
+    _encoder_h264_profile,
+    _parse_sink_video_format,
+    _selected_video_format,
+)
+from ..net import _netdev_tx_bytes, _safe_source_port, harden_rtsp_socket
+from ..p2p.usb_dedicated import mark_p2p_persistent_ok
+from .message import (
+    RTSPMessage, _parse_parameters, _parse_rtp_ports,
+    _parse_transport_client_ports, _read_rtsp_message, _sink_advertises_uibc,
+)
+
+
+class _WFDRTSPHandler(socketserver.StreamRequestHandler):
+    # Consecutive unhealthy probes before auto-rebind (probe interval ~2s).
+    _UNHEALTHY_PROBE_GRACE = 5
+
+    def handle(self) -> None:
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
+        self.local_ip = self.request.getsockname()[0]
+        self.next_cseq = 1
+        self.pending: dict[str, str] = {}
+        self.session_id = str(random.randint(1_000_000, 9_999_999))
+        self._write_lock = threading.Lock()
+        self._keepalive_active = True
+        self.sink_rtp_port: Optional[int] = None
+        self.sink_rtcp_port: int = 0
+        self.source_rtp_port = self.media_config.source_port
+        self.sink_video_format: Optional[WFDVideoFormat] = None
+        self.negotiated_no_audio = False
+        self.negotiated_lpcm = False
+        self.m3_sent = False
+        self.media: Optional[WFDMediaPipeline] = None
+        self.connected_at = time.monotonic()
+        self.play_accepted_at: Optional[float] = None
+        self.setup_ms: Optional[float] = None
+        self.first_tx_reported = False
+        # See _UNHEALTHY_PROBE_GRACE.
+        self._unhealthy_probe_streak = 0
+        # Probes where PIDs are alive but iface TX bytes barely increase.
+        self._stagnant_tx_streak = 0
+        self._last_interval_tx: Optional[int] = None
+        # LPCM muxer counters — video vs audio (audio must not mask video death).
+        self._last_video_frames: Optional[int] = None
+        self._last_audio_frames: Optional[int] = None
+        self._video_stall_streak = 0
+
+        if hasattr(self.server, "parent_server"):
+            self.server.parent_server.has_connected_client = True  # type: ignore[attr-defined]
+
+        harden_rtsp_socket(self.request)
+        print(f"[FluxCast WFD RTSP] TV connected from {peer}; local={self.local_ip}")
+        _append_latency_log(
+            self.media_config.latency_log_path,
+            "rtsp_connected",
+            peer=peer,
+            local_ip=self.local_ip,
+        )
+        try:
+            self._send_m1_options()
+            while True:
+                msg = _read_rtsp_message(self.rfile)
+                if msg is None:
+                    print(f"[FluxCast WFD RTSP] TV disconnected from {peer}")
+                    return
+                self._log_message(msg)
+                if msg.is_response:
+                    self._handle_response(msg)
+                else:
+                    self._handle_request(msg)
+        except WFDNotReady as exc:
+            print(f"[FluxCast WFD RTSP] ERROR: {exc}")
+        except OSError as exc:
+            print(f"[FluxCast WFD RTSP] Socket closed: {exc}")
+        finally:
+            self._keepalive_active = False
+            self._stop_media()
+
+    @property
+    def media_config(self) -> WFDMediaConfig:
+        return self.server.media_config  # type: ignore[attr-defined]
+
+    @property
+    def rtsp_port(self) -> int:
+        return self.server.server_address[1]  # type: ignore[attr-defined]
+
+    def _rtsp_control_uri(self) -> str:
+        return "rtsp://localhost/wfd1.0"
+
+    def _rtsp_presentation_uri(self) -> str:
+        return f"rtsp://{self.local_ip}:{self.rtsp_port}/wfd1.0"
+
+    def _cea_mode(self) -> WFDCEAMode:
+        return _choose_cea_mode(self.media_config, self.sink_video_format)
+
+    def _video_format(self) -> str:
+        return _selected_video_format(self.media_config, self.sink_video_format)
+
+    def _audio_codecs(self) -> str:
+        if self.media_config.no_audio or self.negotiated_no_audio:
+            return "none"
+        if self.negotiated_lpcm:
+            return WFD_AUDIO_LPCM_48K
+        return WFD_AUDIO_AAC
+
+    def _request_idr_frame(self) -> None:
+        """AOSP Converter::requestIDRFrame() analogue — no capture restart.
+
+        ffmpeg/VAAPI has no MediaCodec setParameters path; with GOP≈fps the
+        next sync frame arrives within ~1s. Touch a state file so link-watch
+        can count IDR pressure toward the adaptive ×0.6 loop without us
+        tearing RTP here.
+        """
+        from pathlib import Path
+
+        state = (os.environ.get("XDG_STATE_HOME") or "").strip()
+        if not state:
+            state = str(Path.home() / ".local" / "state")
+        marker = Path(state) / "omarchy-miracast" / "idr-request.stamp"
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(f"{time.time():.3f}\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"[FluxCast WFD RTSP] idr stamp write failed: {exc}")
+        # Optional: if media exposes a force-keyframe hook later, call it here.
+        media = self.media
+        if media is not None and hasattr(media, "request_idr_frame"):
+            try:
+                media.request_idr_frame()  # type: ignore[attr-defined]
+            except Exception as exc:
+                print(f"[FluxCast WFD RTSP] request_idr_frame hook failed: {exc}")
+
+    def _send_bytes(self, text: str) -> None:
+        with self._write_lock:
+            self.wfile.write(text.encode("utf-8"))
+            self.wfile.flush()
+
+    def _send_request(
+        self,
+        name: str,
+        method: str,
+        uri: str,
+        headers: Optional[dict[str, str]] = None,
+        body: str = "",
+    ) -> None:
+        cseq = str(self.next_cseq)
+        self.next_cseq += 1
+        self.pending[cseq] = name
+
+        output = [
+            f"{method} {uri} RTSP/1.0",
+            f"CSeq: {cseq}",
+        ]
+        if headers and "Session" in headers:
+            output.append(f"Session: {headers['Session']}")
+        for key, value in (headers or {}).items():
+            if key == "Session":
+                continue
+            output.append(f"{key}: {value}")
+        if body:
+            output.append("Content-Type: text/parameters")
+            output.append(f"Content-Length: {len(body.encode('utf-8'))}")
+        output.append("")
+        output.append(body)
+        self._send_bytes("\r\n".join(output))
+        print(f"[FluxCast WFD RTSP] -> {name}: {method} (CSeq {cseq})")
+        if body:
+            for line in body.splitlines():
+                if line.startswith("wfd_"):
+                    print(f"[FluxCast WFD RTSP]   {line}")
+
+    def _send_response(
+        self,
+        msg: RTSPMessage,
+        status: str = "200 OK",
+        headers: Optional[dict[str, str]] = None,
+        body: str = "",
+    ) -> None:
+        output = [
+            f"RTSP/1.0 {status}",
+            f"CSeq: {msg.cseq}",
+        ]
+        if headers and "Session" in headers:
+            output.append(f"Session: {headers['Session']}")
+        output.append("Server: FluxCast-WFD/0.1")
+        for key, value in (headers or {}).items():
+            if key == "Session":
+                continue
+            output.append(f"{key}: {value}")
+        if body:
+            output.append("Content-Type: text/parameters")
+        output.append(f"Content-Length: {len(body.encode('utf-8'))}")
+        output.append("")
+        output.append(body)
+        self._send_bytes("\r\n".join(output))
+        print(f"[FluxCast WFD RTSP] -> response {status} for {msg.method or msg.status}")
+
+    def _send_m1_options(self) -> None:
+        self._send_request(
+            "M1_OPTIONS",
+            "OPTIONS",
+            "*",
+            headers={"Require": "org.wfa.wfd1.0"},
+        )
+
+    def _send_m3_get_parameters(self) -> None:
+        if self.m3_sent:
+            return
+        self.m3_sent = True
+        body = (
+            "wfd_content_protection\r\n"
+            "wfd_video_formats\r\n"
+            "wfd_audio_codecs\r\n"
+            "wfd_client_rtp_ports\r\n"
+        )
+        if self.media_config.uibc:
+            body += "wfd_uibc_capability\r\n"
+        self._send_request(
+            "M3_GET_PARAMETER",
+            "GET_PARAMETER",
+            self._rtsp_control_uri(),
+            body=body,
+        )
+
+    def _send_m4_set_parameters(self) -> None:
+        if not self.sink_rtp_port:
+            raise WFDNotReady("TV did not provide a valid RTP port in M3.")
+        sink_rtcp_port = self.sink_rtcp_port if self.sink_rtcp_port > 0 else 0
+        body = (
+            "wfd_content_protection: none\r\n"
+            f"wfd_video_formats: {self._video_format()}\r\n"
+            f"wfd_audio_codecs: {self._audio_codecs()}\r\n"
+            f"wfd_presentation_URL: {self._rtsp_presentation_uri()}/streamid=0 none\r\n"
+            "wfd_client_rtp_ports: RTP/AVP/UDP;unicast "
+            f"{self.sink_rtp_port} {sink_rtcp_port} mode=play\r\n"
+        )
+        if self.media_config.uibc and getattr(self, "sink_supports_uibc", False):
+            from drivers import uibc
+            body += (
+                f"wfd_uibc_capability: {uibc.build_uibc_capability(WFD_UIBC_PORT)}\r\n"
+                "wfd_uibc_setting: enable\r\n"
+            )
+        self._send_request(
+            "M4_SET_PARAMETER",
+            "SET_PARAMETER",
+            self._rtsp_control_uri(),
+            body=body,
+        )
+
+    def _send_m5_trigger_setup(self) -> None:
+        body = "wfd_trigger_method: SETUP\r\n"
+        self._send_request(
+            "M5_TRIGGER_SETUP",
+            "SET_PARAMETER",
+            self._rtsp_control_uri(),
+            body=body,
+        )
+
+    def _handle_response(self, msg: RTSPMessage) -> None:
+        name = self.pending.pop(msg.cseq, "UNKNOWN")
+        if not msg.status.startswith("200"):
+            if name == "M16_KEEPALIVE":
+                # LG (or any TV) rejected our keepalive, STOP RESCHEDULING
+                # but keep the stream alive
+                print(
+                    f"[FluxCast WFD RTSP] M16 keepalive rejected: {msg.status} "
+                    "— disabling keepalive, stream continues."
+                )
+                self._keepalive_active = False
+                return
+            raise WFDNotReady(f"RTSP {name} failed: {msg.start}")
+
+        print(f"[FluxCast WFD RTSP] <- response for {name}: {msg.status}")
+        if name == "M3_GET_PARAMETER":
+            params = _parse_parameters(msg.body)
+            ports = _parse_rtp_ports(params.get("wfd_client_rtp_ports", ""))
+            if not ports or ports[0] <= 0:
+                raise WFDNotReady(
+                    "TV M3 response did not include a usable wfd_client_rtp_ports value."
+                )
+            self.sink_rtp_port, self.sink_rtcp_port = ports
+            self.source_rtp_port = _safe_source_port(
+                self.media_config.source_port,
+                self.sink_rtp_port,
+                self.sink_rtcp_port,
+            )
+            self.sink_video_format = _parse_sink_video_format(
+                params.get("wfd_video_formats", "")
+            )
+            if self.media_config.uibc:
+                self.sink_supports_uibc = _sink_advertises_uibc(params)
+                if not self.sink_supports_uibc:
+                    print(
+                        "[FluxCast WFD RTSP] TV did not advertise UIBC support; "
+                        "input back-channel stays disabled for this session."
+                    )
+            audio = params.get("wfd_audio_codecs", "")
+            _caps = (audio or "").upper()
+            _has_aac = "AAC" in _caps
+            _has_lpcm = "LPCM" in _caps
+            _force_aac = (os.environ.get("FLUXCAST_WFD_FORCE_AAC") or "").strip() in (
+                "1",
+                "true",
+                "yes",
+            )
+            _video_k = _bitrate_to_kbits(self.media_config.bitrate or "4M")
+            _air = read_go_air_mbps()
+            _go_mhz = read_go_oper_mhz()
+            _can5 = read_go_radio_can_5ghz()
+            _lpcm_ok = (
+                _has_lpcm
+                and not _force_aac
+                and link_allows_lpcm(
+                    _air,
+                    _video_k,
+                    go_mhz=_go_mhz,
+                    radio_can_5ghz=_can5,
+                )
+            )
+            if (
+                audio
+                and not self.media_config.no_audio
+                and not _has_aac
+                and not _has_lpcm
+            ):
+                self.negotiated_no_audio = True
+                print(
+                    "[FluxCast WFD RTSP] TV advertised no AAC/LPCM audio; "
+                    "falling back to video-only WFD."
+                )
+            elif audio and _has_lpcm and not _force_aac:
+                # LPCM-only sinks (hotyeah / many Realtek dongles) cannot play
+                # AAC. Do not fall through to AAC when the air check is tight.
+                self.negotiated_lpcm = True
+                extra = " and AAC" if _has_aac else " only"
+                air_s = f"{_air:.1f} Mbps" if _air else "unknown"
+                why = "" if _lpcm_ok else " (air check would have preferred AAC)"
+                print(
+                    f"[FluxCast WFD RTSP] TV advertised LPCM{extra}; "
+                    f"negotiating WFD LPCM (P2P air {air_s}{why}; "
+                    "PIDs 0x1011/0x1100, stream_type 0x83)."
+                )
+            elif audio and _has_aac:
+                self.negotiated_lpcm = False
+                why = "FORCE_AAC" if _force_aac else "P2P air tight for LPCM"
+                if (
+                    not _force_aac
+                    and _go_mhz is not None
+                    and int(_go_mhz) >= 5000
+                    and _can5 is False
+                ):
+                    why = "5 GHz GO; phy cannot carry 5 GHz WFD payload"
+                if _has_lpcm and _force_aac:
+                    print(
+                        "[FluxCast WFD RTSP] TV advertised LPCM; "
+                        "FLUXCAST_WFD_FORCE_AAC=1 — using AAC."
+                    )
+                else:
+                    print(
+                        f"[FluxCast WFD RTSP] using AAC ({why})"
+                    )
+            elif audio and not _has_aac and _has_lpcm and _force_aac:
+                self.negotiated_lpcm = False
+                print(
+                    "[FluxCast WFD RTSP] TV advertised LPCM only; "
+                    "FLUXCAST_WFD_FORCE_AAC=1 — using AAC path."
+                )
+            mode = self._cea_mode()
+            print(
+                f"[FluxCast WFD RTSP] TV RTP port: {self.sink_rtp_port}; "
+                f"source port: {self.source_rtp_port}; audio={audio or 'unknown'}"
+            )
+            print(f"[FluxCast WFD RTSP] Negotiated media mode: {mode.name}")
+            print(f"[FluxCast WFD RTSP] Selected video format: {self._video_format()}")
+            write_mode_state(
+                sink_format=self.sink_video_format,
+                current=mode,
+                peer=self.media_config.peer_address,
+                peer_name=self.media_config.peer_name,
+            )
+            self._send_m4_set_parameters()
+        elif name == "M4_SET_PARAMETER":
+            self._send_m5_trigger_setup()
+
+    def _handle_request(self, msg: RTSPMessage) -> None:
+        method = msg.method
+        if method == "OPTIONS":
+            self._send_response(
+                msg,
+                headers={
+                    "Public": (
+                        "org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, "
+                        "GET_PARAMETER, SET_PARAMETER"
+                    )
+                },
+            )
+            self._send_m3_get_parameters()
+            return
+
+        if method == "GET_PARAMETER":
+            requested = msg.body.lower()
+            lines = []
+            if "wfd_video_formats" in requested:
+                lines.append(f"wfd_video_formats: {self._video_format()}\r\n")
+            if "wfd_audio_codecs" in requested:
+                lines.append(f"wfd_audio_codecs: {self._audio_codecs()}\r\n")
+            if "wfd_content_protection" in requested:
+                lines.append("wfd_content_protection: none\r\n")
+            body = "".join(lines)
+            self._send_response(msg, headers=self._session_header(), body=body)
+            return
+
+        if method == "SET_PARAMETER":
+            if "wfd_idr_request" in msg.body:
+                # WFD §4.10.5: next IDR recovers the decoder. Do not restart
+                # capture. Coalesce — a starved sink re-requests faster than
+                # GOP, and extra I-frames make the air worse.
+                now = time.time()
+                last = float(getattr(self, "_last_idr_ts", 0.0) or 0.0)
+                if should_honor_idr_request(last, now):
+                    self._last_idr_ts = now
+                    print(
+                        "[FluxCast WFD RTSP] Sink requested IDR "
+                        "(next keyframe; no pipeline restart)"
+                    )
+                    self._request_idr_frame()
+                else:
+                    print(
+                        "[FluxCast WFD RTSP] Sink requested IDR "
+                        f"(coalesced; {now - last:.1f}s since last)"
+                    )
+            self._send_response(msg, headers=self._session_header())
+            return
+
+        if method == "SETUP":
+            ports = _parse_transport_client_ports(msg.headers.get("transport", ""))
+            if ports:
+                self.sink_rtp_port, self.sink_rtcp_port = ports
+            if not self.sink_rtp_port:
+                self.sink_rtp_port = 19000
+                self.sink_rtcp_port = 0
+
+            self.source_rtp_port = _safe_source_port(
+                self.media_config.source_port,
+                self.sink_rtp_port,
+                self.sink_rtcp_port,
+            )
+            source_port = self.source_rtp_port
+            if self.sink_rtcp_port:
+                transport = (
+                    "RTP/AVP/UDP;unicast;"
+                    f"client_port={self.sink_rtp_port}-{self.sink_rtcp_port};"
+                    f"server_port={source_port}-{source_port + 1}"
+                )
+            else:
+                transport = (
+                    "RTP/AVP/UDP;unicast;"
+                    f"client_port={self.sink_rtp_port};"
+                    f"server_port={source_port}"
+                )
+            self._send_response(
+                msg,
+                headers={
+                    "Transport": transport,
+                    "Session": f"{self.session_id};timeout=30",
+                },
+            )
+            print(f"[FluxCast WFD RTSP] SETUP complete; RTP sink port={self.sink_rtp_port}")
+            return
+
+        if method == "PLAY":
+            self._send_response(
+                msg,
+                headers={
+                    **self._session_header(),
+                    "Range": "npt=now-",
+                },
+            )
+            # Schedule RTSP M16 keepalive NOW, before _start_media() blocks
+            # on the portal dialog (8-13 s). LG WebOS resets the TCP connection
+            # ~40-45 s after PLAY. Starting the 20 seconds timer here gives a safe
+            # 20 second head start regardless of portal dialog speed.
+            # Microsoft adapter sends TEARDOWN in response to M16 GET_PARAMETER.
+            if "microsoft" not in self.media_config.peer_name.lower():
+                self._schedule_rtsp_keepalive(20.0)
+            else:
+                print("[FluxCast WFD RTSP] Microsoft adapter detected — M16 keepalive disabled.")
+            self._start_media()
+            return
+
+        if method == "PAUSE":
+            self._send_response(msg, headers=self._session_header())
+            self._stop_media()
+            return
+
+        if method == "TEARDOWN":
+            self._send_response(
+                msg,
+                headers={
+                    **self._session_header(),
+                    "Connection": "close",
+                },
+            )
+            self._stop_media()
+            return
+
+        self._send_response(msg, status="405 Method Not Allowed")
+
+    def _session_header(self) -> dict[str, str]:
+        return {"Session": f"{self.session_id};timeout=30"}
+
+    def _start_media(self) -> None:
+        if not self.sink_rtp_port:
+            raise WFDNotReady("Cannot start media before the TV RTP port is known.")
+        if self.media is None:
+            mode = self._cea_mode()
+            effective_config = replace(
+                self.media_config,
+                source_port=self.source_rtp_port,
+                output_resolution=mode.resolution,
+                fps=mode.fps,
+                no_audio=self.media_config.no_audio or self.negotiated_no_audio,
+                prefer_lpcm=(
+                    (
+                        self.negotiated_lpcm
+                        or "microsoft" in self.media_config.peer_name.lower()
+                    )
+                    and not (self.media_config.no_audio or self.negotiated_no_audio)
+                ),
+                h264_profile=_encoder_h264_profile(self.sink_video_format),
+            )
+            # Say so when the sink has no mode matching an explicit --output-res,
+            # instead of silently streaming something else (#84).
+            requested = _parse_resolution(self.media_config.output_resolution)
+            if requested is not None and requested != (mode.width, mode.height):
+                print(
+                    f"[FluxCast WFD RTSP] Requested {requested[0]}x{requested[1]} has no "
+                    f"matching WFD mode on this sink; using {mode.name} instead."
+                )
+            print(
+                f"[FluxCast WFD RTSP] Starting media as {mode.name} "
+                f"(H.264 {effective_config.h264_profile}); "
+                f"RTP source port {self.source_rtp_port}"
+            )
+            if effective_config.aosp_pmt_pid:
+                print("[FluxCast WFD RTSP] AOSP-compatible MPEG-TS requested: PMT 0x0100, PSI version 1 (#84).")
+            schedule_ts_dump_report(effective_config.dump_ts_path)
+            _append_latency_log(
+                self.media_config.latency_log_path,
+                "media_starting",
+                mode=mode.name,
+                tv_ip=self.client_address[0],
+                sink_rtp_port=self.sink_rtp_port,
+                source_rtp_port=self.source_rtp_port,
+            )
+            self.media = WFDMediaPipeline(
+                effective_config,
+                tv_ip=self.client_address[0],
+                local_ip=self.local_ip,
+                sink_rtp_port=self.sink_rtp_port,
+            )
+            if hasattr(self.server, "parent_server"):
+                self.server.parent_server._register_media(self.media)  # type: ignore[attr-defined]
+            self.media.start()
+            print("[FluxCast WFD RTSP] PLAY accepted; media stream started.")
+            mark_p2p_persistent_ok(self.media_config.peer_address)
+            from ..p2p.usb_dedicated import schedule_mid_session_csa
+            schedule_mid_session_csa(
+                delay_s=2.0, peer_mac=self.media_config.peer_address
+            )
+            if self.media_config.uibc and getattr(self, "sink_supports_uibc", False):
+                self._maybe_start_uibc(mode)
+                self._schedule_uibc_enable(1.5)
+            self.play_accepted_at = time.monotonic()
+            self.setup_ms = round((self.play_accepted_at - self.connected_at) * 1000.0, 1)
+            _append_latency_log(
+                self.media_config.latency_log_path,
+                "play_accepted",
+                setup_ms=self.setup_ms,
+            )
+            self._schedule_probe(0.7)
+
+    def _maybe_start_uibc(self, mode) -> None:
+        parent = getattr(self.server, "parent_server", None)
+        if parent is None or parent._uibc_server is not None:
+            return
+        try:
+            from drivers import uibc
+        except Exception as exc:
+            print(f"[FluxCast WFD UIBC] disabled (import failed: {exc})")
+            return
+        monitor = self.media_config.monitor
+        if monitor is not None:
+            mon_w, mon_h, mon_x, mon_y = (
+                monitor.width, monitor.height, monitor.x, monitor.y,
+            )
+        else:
+            mon_w, mon_h, mon_x, mon_y = mode.width, mode.height, 0, 0
+        parent._uibc_server = uibc.start_uibc(
+            WFD_UIBC_PORT, mode.width, mode.height, mon_w, mon_h, mon_x, mon_y,
+        )
+        if parent._uibc_server is not None:
+            print(
+                f"[FluxCast WFD UIBC] input server listening on port "
+                f"{WFD_UIBC_PORT} (sink {mode.width}x{mode.height} -> "
+                f"screen {mon_w}x{mon_h}+{mon_x}+{mon_y})"
+            )
+
+    def _schedule_uibc_enable(self, delay: float) -> None:
+        from drivers import uibc
+        uibc.schedule_post_play_enable(self, delay)
+
+    def _schedule_probe(self, delay: float) -> None:
+        probe = threading.Timer(delay, self._probe_tx)
+        probe.daemon = True
+        probe.start()
+
+    def _schedule_rtsp_keepalive(self, delay: float = 25.0) -> None:
+        """Schedule the next RTSP M16 GET_PARAMETER keepalive."""
+        t = threading.Timer(delay, self._send_rtsp_keepalive)
+        t.daemon = True
+        t.start()
+
+    def _send_rtsp_keepalive(self) -> None:
+        """Send RTSP GET_PARAMETER (M16) on the existing TCP connection."""
+        if not self._keepalive_active:
+            return
+        # M16 keepalives are independent of capture/RTP; always reschedule.
+        try:
+            # Bare Session id — some sinks 454 on ";timeout=" in M16 Session.
+            self._send_request(
+                "M16_KEEPALIVE",
+                "GET_PARAMETER",
+                self._rtsp_presentation_uri(),
+                headers={"Session": self.session_id},
+            )
+            print("[FluxCast WFD RTSP] M16 keepalive sent")
+            # Interval under typical 30s SETUP session timeout.
+            self._schedule_rtsp_keepalive(20.0)
+        except OSError:
+            pass  # Socket dead -> DONT RESCHEDULE
+
+    def _probe_tx(self) -> None:
+        media = self.media
+        if media is None:
+            return
+
+        # Defer while capture rebind is in progress (restarting may be unset).
+        if getattr(media, "restarting", False):
+            self._schedule_probe(1.0)
+            return
+
+        states = []
+        for proc in media.processes:
+            status = "running" if proc.poll() is None else f"exited={proc.returncode}"
+            states.append(f"pid={proc.pid}:{status}")
+
+        if states and all(proc.poll() is None for proc in media.processes):
+            self._unhealthy_probe_streak = 0
+            # Rebind when capture output geometry changed (PIDs may still run).
+            if getattr(media, "capture_geometry_drifted", lambda: False)():
+                print(
+                    "[FluxCast WFD Media] Capture output geometry changed; "
+                    "rebinding desktop capture"
+                )
+                try:
+                    media.restart_video()
+                except Exception as exc:  # noqa: BLE001 — keep probe chain alive
+                    print(f"[FluxCast WFD Media] Capture rebind after geometry drift failed: {exc}")
+                self._schedule_probe(2.0)
+                return
+            current = _netdev_tx_bytes(media.tx_interface)
+            delta = None
+            if media.tx_baseline is not None and current is not None:
+                delta = max(0, current - media.tx_baseline)
+            if (
+                not self.first_tx_reported
+                and delta is not None
+                and delta > 0
+                and self.play_accepted_at is not None
+            ):
+                self.first_tx_reported = True
+                sender_startup_ms = round((time.monotonic() - self.play_accepted_at) * 1000.0, 1)
+                print(
+                    f"[FluxCast WFD Media] Latency probe: first RTP bytes after PLAY in "
+                    f"{sender_startup_ms} ms"
+                )
+                sender_path_latency_ms = None
+                if self.setup_ms is not None:
+                    sender_path_latency_ms = round(self.setup_ms + sender_startup_ms, 1)
+                    print(
+                        "[FluxCast WFD Media] Latency probe: sender-path latency "
+                        f"(RTSP connect -> first RTP) {sender_path_latency_ms} ms"
+                    )
+                _append_latency_log(
+                    self.media_config.latency_log_path,
+                    "latency_probe",
+                    sender_startup_ms=sender_startup_ms,
+                    setup_ms=self.setup_ms,
+                    sender_path_latency_ms=sender_path_latency_ms,
+                )
+            # Stagnant TX: PIDs alive, iface TX < 4 KiB/probe for N probes.
+            # LPCM keeps sending audio while video is wedged (VAAPI pipe hang).
+            # Never treat audio-only progress as healthy — track video separately.
+            # Limits: 12 probes with LPCM (~60s), else 6 (~30s) for iface TX.
+            lpcm = getattr(media, "_lpcm_muxer", None)
+            video_frames = 0
+            audio_frames = 0
+            if lpcm is not None:
+                video_frames = int(getattr(lpcm, "frames_sent", 0) or 0)
+                audio_frames = int(getattr(lpcm, "audio_frames_sent", 0) or 0)
+            prev_video = self._last_video_frames
+            prev_audio = self._last_audio_frames
+            self._last_video_frames = video_frames
+            self._last_audio_frames = audio_frames
+            video_delta = (
+                (video_frames - prev_video) if prev_video is not None else None
+            )
+            audio_delta = (
+                (audio_frames - prev_audio) if prev_audio is not None else None
+            )
+            # AAC path has no LPCM frame counters (always 0). Counting that as
+            # VIDEO_STALL rebound capture every ~8s and left the TV black.
+            if lpcm is None:
+                self._video_stall_streak = 0
+            elif video_delta is not None:
+                if video_delta <= 0:
+                    self._video_stall_streak += 1
+                else:
+                    self._video_stall_streak = 0
+            # Do NOT clear stagnant_tx on video_delta>0 — after a bad rebind,
+            # frames_sent can advance while P2P air TX stays flat (EBADF / dead
+            # RTP). Air-TX stagnant must remain an independent recovery signal.
+
+            # Was 2 — too quick to rebind on brief encode hiccups / counter resets.
+            video_stall_limit = 4
+            if getattr(media, "restarting", False):
+                self._video_stall_streak = 0
+            last_rebind = getattr(self, "_last_stall_rebind", 0.0)
+            if (
+                self._video_stall_streak >= video_stall_limit
+                and (time.monotonic() - last_rebind) < 45.0
+            ):
+                # USB 5 GHz air can freeze TX; restarting capture every 8s
+                # leaves the TV on a black frame.
+                self._video_stall_streak = 0
+            if self._video_stall_streak >= video_stall_limit:
+                print(
+                    "[FluxCast WFD Media] VIDEO_STALL "
+                    f"(video_delta={video_delta}, audio_delta={audio_delta}, "
+                    f"streak={self._video_stall_streak}); rebinding desktop capture",
+                    flush=True,
+                )
+                _append_latency_log(
+                    self.media_config.latency_log_path,
+                    "video_stall",
+                    video_frames=video_frames,
+                    audio_frames=audio_frames,
+                    video_delta=video_delta,
+                    audio_delta=audio_delta,
+                    streak=self._video_stall_streak,
+                )
+                try:
+                    self._last_stall_rebind = time.monotonic()
+                    media.restart_video()
+                    self._stagnant_tx_streak = 0
+                    self._video_stall_streak = 0
+                    self._last_interval_tx = None
+                    self._last_video_frames = None
+                    self._last_audio_frames = None
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        "[FluxCast WFD Media] Capture rebind after "
+                        f"VIDEO_STALL failed: {exc}"
+                    )
+                self._schedule_probe(2.0)
+                return
+
+            if current is not None and self._last_interval_tx is not None:
+                interval = max(0, current - self._last_interval_tx)
+                if interval < 4 * 1024:
+                    # Frames moving + air quiet is the post-rebind RTP death
+                    # mode — escalate faster than pure silence.
+                    bump = 2 if (video_delta is not None and video_delta > 0) else 1
+                    self._stagnant_tx_streak += bump
+                else:
+                    self._stagnant_tx_streak = 0
+                stagnant_limit = 6 if lpcm is not None else 6
+                if self._stagnant_tx_streak >= stagnant_limit:
+                    fails = int(getattr(self, "_stagnant_rebind_fails", 0) or 0) + 1
+                    self._stagnant_rebind_fails = fails
+                    self._stagnant_tx_streak = 0
+                    if fails >= 3:
+                        print(
+                            "[FluxCast WFD Media] RTP TX stagnant after "
+                            f"{fails} rebinds ({interval} B / probe, "
+                            f"video_delta={video_delta}) — giving up",
+                            flush=True,
+                        )
+                        try:
+                            media.stop()
+                        except Exception:
+                            pass
+                        return
+                    print(
+                        "[FluxCast WFD Media] RTP TX stagnant "
+                        f"({interval} B / probe, video_delta={video_delta}); "
+                        f"rebinding desktop capture ({fails}/3)",
+                        flush=True,
+                    )
+                    try:
+                        media.restart_video()
+                        self._video_stall_streak = 0
+                        self._last_interval_tx = None
+                        self._last_video_frames = None
+                        self._last_audio_frames = None
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            "[FluxCast WFD Media] Capture rebind after "
+                            f"stagnant TX failed: {exc}"
+                        )
+                    self._schedule_probe(2.0)
+                    return
+            if current is not None:
+                self._last_interval_tx = current
+            print(
+                f"[FluxCast WFD Media] Sender health: "
+                f"{', '.join(states)}; {media.tx_summary()}"
+                + (
+                    f"; video_frames={video_frames} audio_frames={audio_frames}"
+                    if lpcm is not None
+                    else ""
+                )
+            )
+            _append_latency_log(
+                self.media_config.latency_log_path,
+                "sender_health",
+                processes=states,
+                tx_summary=media.tx_summary(),
+                video_frames=video_frames if lpcm is not None else None,
+                audio_frames=audio_frames if lpcm is not None else None,
+                video_delta=video_delta,
+                audio_delta=audio_delta,
+                video_stall_streak=self._video_stall_streak,
+            )
+            self._schedule_probe(2.0 if self._video_stall_streak > 0 else 5.0)
+            return
+
+        detail = ", ".join(states) if states else "no sender process"
+        print(
+            f"[FluxCast WFD Media] WARNING: RTP sender is not healthy "
+            f"({detail}; {media.tx_summary()})"
+        )
+        # Grace probes before treating the sender as dead.
+        self._unhealthy_probe_streak += 1
+        if self._unhealthy_probe_streak <= self._UNHEALTHY_PROBE_GRACE:
+            self._schedule_probe(2.0)
+            return
+
+        # FLUXCAST_CAPTURE_PAUSE_FILE present → defer rebind.
+        pause_file = os.environ.get("FLUXCAST_CAPTURE_PAUSE_FILE", "").strip()
+        if pause_file and os.path.exists(pause_file):
+            print(
+                "[FluxCast WFD Media] Capture paused externally; "
+                "deferring auto-rebind"
+            )
+            self._schedule_probe(3.0)
+            return
+
+        print("[FluxCast WFD Media] Sender dead; rebinding desktop capture")
+        try:
+            media.restart_video()
+            self._unhealthy_probe_streak = 0
+            self._schedule_probe(5.0)
+        except Exception as exc:  # noqa: BLE001 — keep probe chain alive
+            print(f"[FluxCast WFD Media] Capture rebind after sender death failed: {exc}")
+            # Longer backoff after bind failure.
+            self._schedule_probe(10.0)
+
+    def _stop_media(self) -> None:
+        if self.media is not None:
+            print("[FluxCast WFD Media] Stopping RTP stream...")
+            if hasattr(self.server, "parent_server"):
+                self.server.parent_server._unregister_media(self.media)  # type: ignore[attr-defined]
+            self.media.stop()
+            self.media = None
+
+    def _log_message(self, msg: RTSPMessage) -> None:
+        arrow = "<- response" if msg.is_response else "<- request"
+        print(f"[FluxCast WFD RTSP] {arrow}: {msg.start}")
+        for line in msg.raw_headers:
+            lower = line.lower()
+            if lower.startswith(("cseq:", "transport:", "session:", "content-type:", "content-length:")):
+                print(f"[FluxCast WFD RTSP]   {line}")
+        if msg.body:
+            for line in msg.body.splitlines():
+                if line.startswith("wfd_"):
+                    print(f"[FluxCast WFD RTSP]   {line}")
