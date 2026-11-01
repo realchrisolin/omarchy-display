@@ -30,6 +30,9 @@ PanelWindow {
   property var savedSettings: ({})
   property var miracast: null
   property bool miracastAdvancedOpen: false
+  property bool additionalDetailsOpen: false
+  property var edidInfo: ({})
+  readonly property string pluginBin: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/realchrisolin.display/bin"
 
   // Seconds a tried change waits for Keep before it is reverted.
   readonly property int trialSeconds: 30
@@ -59,6 +62,8 @@ PanelWindow {
   property real stagedScale: 1
   property int stagedTransform: 0
   property int stagedVrr: 0
+  property int stagedBitdepth: 8
+  property string stagedCm: "srgb"
   // hyprctl reports VRR as a boolean, so "fullscreen only" (2) is known from
   // the saved settings alone. What the display runs with now.
   property int currentVrr: 0
@@ -76,7 +81,7 @@ PanelWindow {
   readonly property bool trying: trialBefore !== null
 
   // Keyboard cursor: a row from `rows` and a column within it.
-  readonly property var rows: ["resolution", "refresh", "scale", "rotation", "vrr", "actions"]
+  readonly property var rows: ["details", "resolution", "refresh", "scale", "rotation", "bitdepth", "colorspace", "hdr", "vrr", "actions"]
   property var monitors: []
   property int cursorRow: 0
   property int cursorCol: 0
@@ -114,6 +119,8 @@ PanelWindow {
     if (!LayoutModel.settingsMatch(monitor, { scale: scale })) changes.scale = scale
     if (stagedTransform !== (Number(monitor.transform) || 0)) changes.transform = stagedTransform
     if (stagedVrr !== currentVrr) changes.vrr = stagedVrr
+    if (stagedBitdepth !== LayoutModel.liveBitdepth(monitor)) changes.bitdepth = stagedBitdepth
+    if (stagedCm !== LayoutModel.liveCm(monitor)) changes.cm = stagedCm
     return changes
   }
   readonly property bool dirty: Object.keys(pending).length > 0
@@ -127,7 +134,20 @@ PanelWindow {
     stagedTransform = Number(monitor.transform) || 0
     currentVrr = savedSettings && savedSettings.vrr === 2 ? 2 : (monitor.vrr ? 1 : 0)
     stagedVrr = currentVrr
+    stagedBitdepth = LayoutModel.liveBitdepth(monitor)
+    stagedCm = LayoutModel.liveCm(monitor)
     miracastAdvancedOpen = false
+    additionalDetailsOpen = false
+    loadEdid()
+  }
+
+  function loadEdid() {
+    if (!monitor || LayoutModel.isVirtualHead(monitor)) {
+      edidInfo = ({})
+      return
+    }
+    edidProc.command = [pluginBin + "/identify-display-capabilities", String(monitor.name)]
+    edidProc.running = true
   }
 
   function stage(settings) {
@@ -226,6 +246,9 @@ PanelWindow {
     if (row === "refresh") return refreshRates
     if (row === "scale") return scaleOptions
     if (row === "rotation") return rotationOptions
+    if (row === "bitdepth") return LayoutModel.bitdepthOptions()
+    if (row === "colorspace") return LayoutModel.colorSpaceOptions()
+    if (row === "hdr") return LayoutModel.hdrOptions()
     if (row === "vrr") return vrrOptions
     if (row === "actions") return [0, 1]
     return []
@@ -236,6 +259,9 @@ PanelWindow {
     var value = row === "refresh" ? stagedRefresh
       : row === "scale" ? String(stagedScale)
       : row === "rotation" ? String(stagedTransform)
+      : row === "bitdepth" ? String(stagedBitdepth)
+      : row === "colorspace" ? stagedCm
+      : row === "hdr" ? ((LayoutModel.isHdrPreset(stagedCm) || stagedCm === "auto") ? "1" : "0")
       : row === "vrr" ? String(stagedVrr) : ""
     for (var i = 0; i < options.length; i++) {
       if (row === "scale") {
@@ -265,7 +291,10 @@ PanelWindow {
   function activate() {
     if (!cursorActive) { cursorActive = true; return }
     var row = rows[cursorRow]
+    if (row === "details") { additionalDetailsOpen = !additionalDetailsOpen; return }
     if (row === "resolution") { resolutionDropdown.open(); return }
+    if (row === "refresh") { refreshDropdown.open(); return }
+    if (row === "colorspace") { colorSpaceDropdown.open(); return }
     if (row === "actions") {
       if (cursorCol === 0) close()
       else tryChanges()
@@ -281,6 +310,18 @@ PanelWindow {
     if (row === "refresh") stagedRefresh = value
     else if (row === "scale") stagedScale = Number(Model.cleanScale(value, stagedWidth, stagedHeight)) || Number(value)
     else if (row === "rotation") stagedTransform = Number(value)
+    else if (row === "bitdepth") stagedBitdepth = Number(value)
+    else if (row === "colorspace") stagedCm = String(value)
+    else if (row === "hdr") {
+      if (String(value) === "1") {
+        // cm=hdr modesets this USB-C panel off. Auto is Hyprland's
+        // recommended preset (sRGB at 8-bit, wide at 10-bit).
+        stagedCm = "auto"
+        if (stagedBitdepth < 10) stagedBitdepth = 10
+      } else if (LayoutModel.isHdrPreset(stagedCm) || stagedCm === "auto") {
+        stagedCm = "srgb"
+      }
+    }
     else if (row === "vrr") stagedVrr = Number(value)
   }
 
@@ -308,7 +349,7 @@ PanelWindow {
       countdownTimer.restart()
       return
     }
-    var names = { mode: "mode", scale: "scale", transform: "rotation", vrr: "adaptive sync" }
+    var names = { mode: "mode", scale: "scale", transform: "rotation", vrr: "adaptive sync", bitdepth: "bit depth", cm: "color space" }
     revert()
     rejectMessage = "THE DISPLAY DID NOT ACCEPT THIS " + rejected.map(function(field) {
       return names[field]
@@ -381,6 +422,16 @@ PanelWindow {
         var monitors = []
         try { monitors = JSON.parse(String(text || "[]")) } catch (e) { monitors = [] }
         root.verifyTrial(monitors)
+      }
+    }
+  }
+
+  Process {
+    id: edidProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.edidInfo = JSON.parse(String(text || "{}")) } catch (e) { root.edidInfo = ({}) }
       }
     }
   }
@@ -484,7 +535,7 @@ PanelWindow {
       anchors.rightMargin: card.contentRightInset
       anchors.bottomMargin: card.contentBottomInset
       anchors.leftMargin: card.contentLeftInset
-      blocked: resolutionDropdown.popupOpen
+      blocked: resolutionDropdown.popupOpen || refreshDropdown.popupOpen || colorSpaceDropdown.popupOpen
       onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
       onActivateRequested: root.activate()
       onCloseRequested: root.trying ? root.revert() : root.close()
@@ -530,12 +581,13 @@ PanelWindow {
 
             Text {
               textFormat: Text.PlainText
-              text: root.monitor ? (root.internal ? "Built-in display" : LayoutModel.tileLabel(root.monitor, root.monitors)) : ""
+              text: root.monitor ? LayoutModel.tileLabel(root.monitor, root.monitors, 32) : ""
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
               elide: Text.ElideRight
+              maximumLineCount: 1
               width: parent.width
             }
 
@@ -544,12 +596,12 @@ PanelWindow {
               text: {
                 var m = root.monitor
                 if (!m) return ""
-                var parts = [String(m.name)]
+                var parts = [LayoutModel.tilePort(m, root.monitors)]
                 var inches = LayoutModel.diagonalInches(m.physicalWidth, m.physicalHeight)
                 if (inches > 0) parts.push(inches + "″")
                 var ppi = LayoutModel.pixelDensity(m.width, m.height, m.physicalWidth, m.physicalHeight)
                 if (ppi > 0) parts.push(ppi + " PPI")
-                return parts.join(" · ").toUpperCase()
+                return parts.join(" · ")
               }
               color: root.muted
               font.family: root.fontFamily
@@ -583,12 +635,9 @@ PanelWindow {
                 ["Manufacturer", String(m.make || "").trim()],
                 ["Model", String(m.model || "").trim()],
                 ["Serial", String(m.serial || "").trim()],
-                ["Connector", String(m.name || "")],
+                ["Connector", LayoutModel.portCode(m, root.monitors) || String(m.name || "")],
                 ["Physical size", Number(m.physicalWidth) > 0
-                  ? m.physicalWidth + " × " + m.physicalHeight + " mm" : ""],
-                ["Workspace area", LayoutModel.logicalSize(m).w + " × " + LayoutModel.logicalSize(m).h
-                  + " at " + m.x + ", " + m.y],
-                ["Pixel format", String(m.currentFormat || "")]
+                  ? m.physicalWidth + " × " + m.physicalHeight + " mm" : ""]
               ]
               return rows.filter(function(row) { return row[1] !== "" })
             }
@@ -601,51 +650,205 @@ PanelWindow {
           }
         }
 
+        // ---------- Additional details (EDID / CTA vs current) ----------
+        Column {
+          visible: !root.virtualHead
+          width: parent.width
+          spacing: Style.space(6)
+
+          Item {
+            width: parent.width
+            implicitHeight: extraHdr.implicitHeight + (root.additionalDetailsOpen ? extraBody.implicitHeight + Style.space(8) : 0)
+
+            MouseArea {
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              height: extraHdr.implicitHeight
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.hoverCursor("details", 0)
+                root.additionalDetailsOpen = !root.additionalDetailsOpen
+              }
+            }
+
+            Row {
+              id: extraHdr
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              Text {
+                text: root.additionalDetailsOpen ? "󰅀" : "󰅂"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                text: "ADDITIONAL DETAILS"
+                color: root.hasCursor("details") ? root.foreground : root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.2
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Column {
+              id: extraBody
+              visible: root.additionalDetailsOpen
+              y: extraHdr.height + Style.space(8)
+              width: parent.width
+              spacing: Style.space(4)
+              readonly property real valueColWidth: Math.max(currentHdr.implicitWidth, advertisedHdr.implicitWidth, 120)
+
+              Item {
+                width: parent.width
+                implicitHeight: currentHdr.implicitHeight
+                visible: extraRepeater.count > 0
+                Text {
+                  id: currentHdr
+                  anchors.right: advertisedHdr.left
+                  anchors.rightMargin: Style.space(12)
+                  width: extraBody.valueColWidth
+                  text: "Current"
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  horizontalAlignment: Text.AlignRight
+                }
+                Text {
+                  id: advertisedHdr
+                  anchors.right: parent.right
+                  width: extraBody.valueColWidth
+                  text: "Advertised"
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  horizontalAlignment: Text.AlignRight
+                }
+              }
+
+              Repeater {
+                id: extraRepeater
+                model: LayoutModel.additionalDetailsRows(root.monitor, root.edidInfo)
+                CapabilityRow {
+                  required property var modelData
+                  label: modelData.label
+                  current: modelData.current || ""
+                  advertised: modelData.advertised || ""
+                  colWidth: extraBody.valueColWidth
+                }
+              }
+            }
+          }
+        }
+
         // ---------- Mode ----------
         PanelSeparator { foreground: root.foreground }
 
         Column {
           width: parent.width
-          spacing: Style.space(10)
+          spacing: Style.space(8)
           enabled: !root.trying
           opacity: enabled ? 1 : 0.5
 
-          SectionHeader { text: "RESOLUTION" }
-
-          Dropdown {
-            id: resolutionDropdown
-            width: parent.width
-            showLabel: false
-            options: root.resolutions
-            value: root.stagedWidth + "x" + root.stagedHeight
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            hasCursor: root.hasCursor("resolution")
-            onChanged: function(value) { root.stageResolution(value) }
-            onHovered: function(isHovered) { if (isHovered) root.hoverCursor("resolution", 0) }
-          }
-
-          SectionHeader { text: "REFRESH RATE" }
-          PillRow { row: "refresh"; options: root.refreshRates; value: root.stagedRefresh }
-
-          SectionHeader { text: "SCALE" }
-          PillRow {
-            row: "scale"
-            options: root.scaleOptions
-            value: {
-              for (var i = 0; i < root.scaleOptions.length; i++) {
-                var v = root.scaleOptions[i].value
-                if (Math.abs(Number(Model.cleanScale(v, root.stagedWidth, root.stagedHeight)) - root.stagedScale) < 0.005) return v
-              }
-              return ""
+          SettingRow {
+            title: "Resolution"
+            settingRow: "resolution"
+            Dropdown {
+              id: resolutionDropdown
+              width: parent.width
+              showLabel: false
+              options: root.resolutions
+              value: root.stagedWidth + "x" + root.stagedHeight
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: root.hasCursor("resolution")
+              onChanged: function(value) { root.stageResolution(value) }
+              onHovered: function(isHovered) { if (isHovered) root.hoverCursor("resolution", 0) }
             }
           }
 
-          SectionHeader { text: "ROTATION" }
-          PillRow { row: "rotation"; options: root.rotationOptions; value: String(root.stagedTransform) }
+          SettingRow {
+            title: "Refresh rate"
+            settingRow: "refresh"
+            Dropdown {
+              id: refreshDropdown
+              width: parent.width
+              showLabel: false
+              options: root.refreshRates
+              value: root.stagedRefresh
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: root.hasCursor("refresh")
+              onChanged: function(value) { root.choose("refresh", value) }
+              onHovered: function(isHovered) { if (isHovered) root.hoverCursor("refresh", 0) }
+            }
+          }
 
-          SectionHeader { text: "ADAPTIVE SYNC" }
-          PillRow { row: "vrr"; options: root.vrrOptions; value: String(root.stagedVrr) }
+          SettingRow {
+            title: "Scale"
+            settingRow: "scale"
+            PillRow {
+              row: "scale"
+              options: root.scaleOptions
+              value: {
+                for (var i = 0; i < root.scaleOptions.length; i++) {
+                  var v = root.scaleOptions[i].value
+                  if (Math.abs(Number(Model.cleanScale(v, root.stagedWidth, root.stagedHeight)) - root.stagedScale) < 0.005) return v
+                }
+                return ""
+              }
+            }
+          }
+
+          SettingRow {
+            title: "Rotation"
+            settingRow: "rotation"
+            PillRow { row: "rotation"; options: root.rotationOptions; value: String(root.stagedTransform) }
+          }
+
+          SettingRow {
+            title: "Bit depth"
+            settingRow: "bitdepth"
+            rowVisible: !root.virtualHead
+            PillRow { row: "bitdepth"; options: LayoutModel.bitdepthOptions(); value: String(root.stagedBitdepth) }
+          }
+
+          SettingRow {
+            title: "Color space"
+            settingRow: "colorspace"
+            rowVisible: !root.virtualHead
+            Dropdown {
+              id: colorSpaceDropdown
+              width: parent.width
+              showLabel: false
+              options: LayoutModel.colorSpaceOptions()
+              value: root.stagedCm
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: root.hasCursor("colorspace")
+              onChanged: function(value) { root.choose("colorspace", value) }
+              onHovered: function(isHovered) { if (isHovered) root.hoverCursor("colorspace", 0) }
+            }
+          }
+
+          SettingRow {
+            title: "HDR"
+            settingRow: "hdr"
+            rowVisible: !root.virtualHead
+            PillRow { row: "hdr"; options: LayoutModel.hdrOptions(); value: (LayoutModel.isHdrPreset(root.stagedCm) || root.stagedCm === "auto") ? "1" : "0" }
+          }
+
+          SettingRow {
+            title: "Adaptive sync"
+            settingRow: "vrr"
+            PillRow { row: "vrr"; options: root.vrrOptions; value: String(root.stagedVrr) }
+          }
         }
 
         Column {
@@ -933,6 +1136,44 @@ PanelWindow {
     }
   }
 
+  component SettingRow: Item {
+    id: srow
+    property string title: ""
+    property string settingRow: ""
+    property bool rowVisible: true
+    default property alias contents: controlHost.data
+    width: parent ? parent.width : 0
+    visible: rowVisible
+    implicitHeight: visible ? Math.max(sLabel.implicitHeight, controlHost.implicitHeight, Style.spacing.controlHeight) : 0
+
+    HoverHandler {
+      onHoveredChanged: if (hovered) root.hoverCursor(srow.settingRow, 0)
+    }
+
+    Text {
+      id: sLabel
+      width: 108
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
+      text: srow.title
+      color: root.hasCursor(srow.settingRow) ? root.foreground : root.muted
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      wrapMode: Text.WordWrap
+    }
+
+    Item {
+      id: controlHost
+      anchors.left: parent.left
+      anchors.leftMargin: 120
+      anchors.right: parent.right
+      implicitHeight: children.length > 0 ? children[0].implicitHeight : 0
+      height: implicitHeight
+    }
+  }
+
   component SectionHeader: PanelSectionHeader {
     foreground: root.foreground
     fontFamily: root.fontFamily
@@ -967,6 +1208,60 @@ PanelWindow {
       elide: Text.ElideLeft
       anchors.left: detailLabel.right
       anchors.leftMargin: Style.space(12)
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+    }
+  }
+
+  component CapabilityRow: Item {
+    id: cap
+    property string label: ""
+    property string current: ""
+    property string advertised: ""
+    property real colWidth: 120
+    width: parent ? parent.width : 0
+    implicitHeight: Math.max(capLabel.implicitHeight, capCurrent.implicitHeight, capAdvertised.implicitHeight)
+
+    Text {
+      id: capLabel
+      textFormat: Text.PlainText
+      text: cap.label
+      color: root.muted
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.NoWrap
+      elide: Text.ElideRight
+      anchors.left: parent.left
+      anchors.right: capCurrent.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+    }
+    Text {
+      id: capCurrent
+      textFormat: Text.PlainText
+      text: cap.current
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      horizontalAlignment: Text.AlignRight
+      wrapMode: Text.NoWrap
+      elide: Text.ElideNone
+      width: cap.colWidth
+      anchors.right: capAdvertised.left
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+    }
+    Text {
+      id: capAdvertised
+      textFormat: Text.PlainText
+      text: cap.advertised
+      color: root.muted
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      horizontalAlignment: Text.AlignRight
+      wrapMode: Text.NoWrap
+      elide: Text.ElideNone
+      width: cap.colWidth
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
     }

@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Map DRM connector names to usb|dp|hdmi|edp|dvi|vga.
+
+USB-C DP-alt still appears as DP-N in Hyprland. Type-C ports that advertise
+DisplayPort SID 0xff01 claim that many DP connectors (sorted by index); the
+rest stay dp. HDMI/DVI/VGA/eDP use the connector name.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+DP_SID = {"ff01", "0xff01"}
+DRM = Path("/sys/class/drm")
+TYPEC = Path("/sys/class/typec")
+CARD = re.compile(r"^card\d+-(.+)$")
+DP_NAME = re.compile(r"^(?:DP|DisplayPort)-(\d+)$", re.I)
+
+
+def typec_dp_ports() -> int:
+    if not TYPEC.is_dir():
+        return 0
+    n = 0
+    for port in TYPEC.iterdir():
+        if not port.is_dir() or not re.fullmatch(r"port\d+", port.name):
+            continue
+        for alt in port.iterdir():
+            if not alt.is_dir() or not re.fullmatch(r"port\d+\.\d+", alt.name):
+                continue
+            svid = ""
+            try:
+                svid = (alt / "svid").read_text(encoding="utf-8").strip().lower()
+            except OSError:
+                continue
+            if svid in DP_SID:
+                n += 1
+                break
+    return n
+
+
+def drm_name(entry: Path) -> str | None:
+    m = CARD.match(entry.name)
+    return m.group(1) if m else None
+
+
+def kind_from_name(name: str) -> str | None:
+    if re.match(r"^(eDP|LVDS|DSI)-", name, re.I):
+        return "edp"
+    if re.match(r"^HDMI", name, re.I):
+        return "hdmi"
+    if re.match(r"^DVI-", name, re.I):
+        return "dvi"
+    if re.match(r"^VGA-", name, re.I):
+        return "vga"
+    if DP_NAME.match(name):
+        return "dp"
+    return None
+
+
+def main() -> int:
+    kinds: dict[str, str] = {}
+    dps: list[tuple[int, str]] = []
+    if DRM.is_dir():
+        for entry in sorted(DRM.iterdir()):
+            if not entry.is_dir():
+                continue
+            name = drm_name(entry)
+            if not name:
+                continue
+            kind = kind_from_name(name)
+            if kind is None:
+                continue
+            if kind == "dp":
+                idx = int(DP_NAME.match(name).group(1))
+                dps.append((idx, name))
+            else:
+                kinds[name] = kind
+    usb_n = typec_dp_ports()
+    dps.sort()
+    for i, (_, name) in enumerate(dps):
+        kinds[name] = "usb" if i < usb_n else "dp"
+    json.dump(kinds, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

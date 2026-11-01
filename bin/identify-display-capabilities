@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Read one DRM connector's EDID and print capability JSON.
+
+Usage:
+  identify-display-capabilities DP-1
+  identify-display-capabilities --edid path/to.bin [--name DP-1]
+
+No EDID or unknown connector → {}.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+DRM = Path("/sys/class/drm")
+CARD = re.compile(r"^card\d+-(.+)$")
+AUDIO_FMT = {1: "LPCM", 2: "AC-3", 7: "DTS", 10: "AAC", 11: "DTS-HD", 12: "MLP"}
+
+
+def find_edid(name: str) -> bytes | None:
+    if not DRM.is_dir():
+        return None
+    for entry in DRM.iterdir():
+        m = CARD.match(entry.name)
+        if not m or m.group(1) != name:
+            continue
+        path = entry / "edid"
+        if not path.is_file():
+            return None
+        data = path.read_bytes()
+        return data or None
+    return None
+
+
+def parse_edid(raw: bytes) -> dict:
+    if len(raw) < 128:
+        return {}
+    mfg = (raw[8] << 8) | raw[9]
+    info: dict = {
+        "mfgId": "".join(
+            chr(((mfg >> 10) & 31) + 64)
+            + chr(((mfg >> 5) & 31) + 64)
+            + chr((mfg & 31) + 64)
+        ),
+        "productCode": raw[10] | (raw[11] << 8),
+        "week": raw[16],
+        "year": 1990 + raw[17],
+        "edidVersion": f"{raw[18]}.{raw[19]}",
+        "names": [],
+        "serial": None,
+        "rangeHz": None,
+        "bitDepth": None,
+        "videoInterface": None,
+        "srgbDefault": bool(raw[24] & 0x04),
+        "audio": None,
+        "hdrStatic": False,
+    }
+    names = []
+    for off in (54, 72, 90, 108):
+        d = raw[off : off + 18]
+        if d[0] | d[1] | d[2]:
+            continue
+        tag = d[3]
+        text = d[5:18].split(b"\n")[0].split(b"\x00")[0].decode("latin1", "replace").strip()
+        if tag == 0xFC and text:
+            names.append(text)
+        elif tag == 0xFF and text:
+            info["serial"] = text
+        elif tag == 0xFD:
+            info["rangeHz"] = {"min": d[5], "max": d[6]}
+    info["names"] = names
+
+    inp = raw[20]
+    if inp & 0x80:
+        bpc = [None, 6, 8, 10, 12, 14, 16, None][(inp >> 4) & 7]
+        info["bitDepth"] = bpc
+        iface = ["undefined", "DVI", "HDMI-a", "HDMI-b", "MDDI", "DisplayPort"]
+        info["videoInterface"] = iface[inp & 7] if (inp & 7) < len(iface) else None
+
+    if len(raw) >= 256 and raw[128] == 0x02:
+        dtd = raw[130]
+        i = 132
+        audio = []
+        while i < 128 + dtd and i + 1 <= len(raw):
+            hdr = raw[i]
+            kind = (hdr >> 5) & 7
+            ln = hdr & 31
+            payload = raw[i + 1 : i + 1 + ln]
+            if kind == 1:
+                for j in range(0, len(payload), 3):
+                    if j >= len(payload):
+                        break
+                    fmt = (payload[j] >> 3) & 15
+                    ch = (payload[j] & 7) + 1
+                    audio.append({"format": AUDIO_FMT.get(fmt, str(fmt)), "channels": ch})
+            elif kind == 7 and payload:
+                # CTA extended tag 6 = HDR static metadata
+                if payload[0] == 6:
+                    info["hdrStatic"] = True
+            i += 1 + ln
+        if audio:
+            info["audio"] = audio
+    return info
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("name", nargs="?", default="")
+    ap.add_argument("--edid", type=Path, default=None)
+    args = ap.parse_args()
+    raw = None
+    if args.edid is not None:
+        raw = args.edid.read_bytes()
+    elif args.name:
+        raw = find_edid(args.name)
+    if not raw:
+        json.dump({}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+    json.dump(parse_edid(raw), sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

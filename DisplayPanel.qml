@@ -1064,6 +1064,7 @@ Panel {
 
     readonly property bool isFocused: display && display.focused
     readonly property bool canToggle: display && (!display.enabled || root.enabledDisplayCount > 1)
+    readonly property var tagged: LayoutModel.withPortKinds([display], arrangement.portKinds)[0]
 
     hasCursor: root.cursorActive && root.focusSection === "monitors" && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(monitorRow)
@@ -1093,15 +1094,32 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
       }
 
-      Text {
-        textFormat: Text.PlainText
-        text: LayoutModel.tileLabel(monitorRow.display, root.displays) + (monitorRow.display.focused ? " · focused" : "")
-        color: root.bar.foreground
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.body
-        elide: Text.ElideRight
+      Column {
         width: parent.width - Style.space(22) - Style.space(14) - Style.space(16)
+        spacing: Style.space(2)
         anchors.verticalCenter: parent.verticalCenter
+
+        Text {
+          textFormat: Text.PlainText
+          text: LayoutModel.tileLabel(monitorRow.tagged, root.displays)
+          color: root.bar.foreground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+          maximumLineCount: 1
+          width: parent.width
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: LayoutModel.tilePort(monitorRow.tagged, root.displays) + (monitorRow.display.focused ? " · focused" : "")
+          color: Qt.darker(root.bar.foreground, 1.4)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          maximumLineCount: 1
+          width: parent.width
+        }
       }
 
       Text {

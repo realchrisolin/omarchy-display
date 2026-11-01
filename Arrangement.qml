@@ -44,6 +44,8 @@ Column {
   property var tiles: []
   // Raw `hyprctl monitors all -j` output behind the tiles.
   property var monitors: []
+  // Connector name → usb|dp|hdmi|edp (bin/identify-display-port-types).
+  property var portKinds: ({})
   readonly property bool hasInternal: monitors.some(function(monitor) { return LayoutModel.isInternal(monitor) })
   // Outputs showing their Identify badge (see identify()).
   property var identifyOutputs: []
@@ -275,7 +277,22 @@ Column {
   // The cursor stays on the picked-up tile as it moves.
   onGrabbedIndexChanged: if (grabbedIndex >= 0) selectedIndex = grabbedIndex
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: {
+    if (!portKindsProc.running) portKindsProc.running = true
+    refresh()
+  }
+
+  Process {
+    id: portKindsProc
+    command: [(Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/realchrisolin.display/bin/identify-display-port-types"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.portKinds = JSON.parse(String(text || "{}")) } catch (e) { root.portKinds = ({}) }
+        if (root.active) root.refresh()
+      }
+    }
+  }
 
   Process {
     id: monitorsProc
@@ -286,6 +303,7 @@ Column {
       onStreamFinished: {
         var monitors = []
         try { monitors = JSON.parse(String(text || "[]")) } catch (e) { monitors = [] }
+        monitors = LayoutModel.withPortKinds(monitors, root.portKinds)
         root.monitors = monitors
         var layout = LayoutModel.migrateLayoutOrder(orderFile.layout, monitors)
         if (JSON.stringify(layout.order) !== JSON.stringify(orderFile.layout.order || []))
@@ -508,6 +526,7 @@ Column {
           height: restRect.height
           icon: modelData.virtual ? "󰖩" : (modelData.internal ? "󰌢" : "󰍹")
           label: modelData.label
+          port: modelData.port || ""
           number: index + 1
           highlighted: modelData.focused
           grabbed: dragged || root.grabbedIndex === index
@@ -719,7 +738,7 @@ Column {
       for (var i = 0; i < root.tiles.length; i++) {
         var tile = root.tiles[i]
         if (root.identifyOutputs.indexOf(tile.name) === -1 && tile.name !== root.propertiesOutput) continue
-        list.push({ output: tile.name, number: i + 1, label: tile.internal ? "Built-in display" : tile.label })
+        list.push({ output: tile.name, number: i + 1, label: tile.label, port: tile.port })
       }
       return root.active ? list : []
     }
@@ -749,6 +768,7 @@ Column {
     id: tile
     property string icon: ""
     property string label: ""
+    property string port: ""
     property int number: 0
     // "above" / "below" / "left" / "right": the dragged display would land here.
     property string dropSide: ""
@@ -817,12 +837,26 @@ Column {
         width: parent.width
         horizontalAlignment: Text.AlignHCenter
         elide: Text.ElideRight
+        maximumLineCount: 1
         textFormat: Text.PlainText
         text: tile.label
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
+      }
+
+      Text {
+        width: parent.width
+        horizontalAlignment: Text.AlignHCenter
+        elide: Text.ElideRight
+        maximumLineCount: 1
+        textFormat: Text.PlainText
+        text: tile.port
+        color: Qt.darker(root.bar.foreground, 1.4)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        visible: tile.port !== ""
       }
     }
   }

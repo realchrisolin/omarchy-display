@@ -19,9 +19,16 @@ Bar entry is `DisplayPanel.qml` (`Panel.qml` is kept for merging upstream).
 
 ### Changed
 
-- DISPLAY SETTINGS tiles (and the DISPLAYS list) are named by port:
-  Built-in, USB-C 1 / USB-C 2 on a laptop's DP connectors, HDMI 1, Miracast.
-  EDID model "Display" is no longer used as the tile title.
+- DISPLAY SETTINGS tiles show truncated vendor/model on the first line and
+  the connector on the second. Type-C DP-alt is `(USB-1)`; a full DisplayPort
+  stays `(DP-1)`; HDMI is `(HDMI-1)`. The index is the DRM connector number.
+- Properties modal ADDITIONAL DETAILS (collapsed) lists EDID/CTA capabilities
+  vs current Hyprland state: bit depth, color space, HDR, VRR, refresh range,
+  display audio, manufacture date, product code.
+- Per-display bit depth (8/10), color space (Hyprland `cm` presets), and HDR
+  in the properties modal, with the same apply/keep/revert trial as mode and
+  VRR. HDR On sets `cm = auto` (not experimental `hdr`), which blanked the
+  USB-C panel.
 
 ### Fixed
 

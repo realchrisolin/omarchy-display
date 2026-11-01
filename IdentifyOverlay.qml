@@ -99,7 +99,7 @@ Scope {
 
               Text {
                 textFormat: Text.PlainText
-                text: badge.modelData.name.toUpperCase()
+                text: badge.shown && badge.shown.port ? badge.shown.port : badge.modelData.name.toUpperCase()
                 color: Qt.darker(root.foreground, 1.4)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

@@ -144,28 +144,69 @@ test("kenya Hyprland disabled=true on a live eDP is still arranged", () => {
   assert.deepEqual(tiles.map(t => t.name), ["eDP-1", "persistent-miracast"])
 })
 
-test("tileLabel names the built-in panel and HDMI by connector", () => {
-  assert.equal(Model.tileLabel(laptop), "Built-in")
-  assert.equal(Model.tileLabel({ ...ultrawide, model: "U34V5C" }), "HDMI 1")
-  assert.equal(Model.tileLabel(ultrawide), "HDMI 1")
-  assert.equal(Model.tileLabel({ name: "DP-3", description: "" }), "DisplayPort 3")
+test("tileLabel is a truncated vendor/model; tilePort is the DRM connector", () => {
+  assert.equal(Model.tileLabel(laptop), "Lenovo Group")
+  assert.equal(Model.tilePort(laptop), "(eDP-1)")
+  const named = { ...ultrawide, make: "AOC", model: "U34V5C" }
+  assert.equal(Model.tileLabel(named), "AOC U34V5C")
+  assert.equal(Model.tilePort(named), "(HDMI-1)")
+  assert.equal(Model.tilePort({ name: "DP-3" }), "(DP-3)")
+  assert.equal(Model.tilePort({ name: "HDMI-A-0" }), "(HDMI-0)")
+  assert.equal(Model.tilePort({ name: "DVI-D-0" }), "(DVI-0)")
+  const long = { make: "Chimei Innolux ExtraWide Panel Corporation", model: "0x14E7", name: "eDP-1" }
+  assert.equal(Model.tileLabel(long, null, 99), "Chimei Innolux ExtraWide Panel")
+  assert.equal(Model.tileLabel(long).length, 18)
+  assert.match(Model.tileLabel(long), /…$/)
 })
 
-test("tileLabel uses USB-C N for laptop DP connectors and HDMI N for HDMI", () => {
-  const hdmi = { ...ultrawide, name: "HDMI-A-1", model: "Display" }
-  const usb1 = { ...portrait, name: "DP-1", description: "BOE Display L56051794302", model: "Display" }
-  const usb2 = { ...portrait, name: "DP-2", description: "BOE Display other", model: "Display", x: 3840 }
-  const list = [laptop, usb1, usb2, hdmi]
-  assert.equal(Model.tileLabel(laptop, list), "Built-in")
-  assert.equal(Model.tileLabel(usb1, list), "USB-C 1")
-  assert.equal(Model.tileLabel(usb2, list), "USB-C 2")
-  assert.equal(Model.tileLabel(hdmi, list), "HDMI 1")
-  assert.equal(Model.tileLabel({ name: "persistent-miracast" }, list), "Miracast")
+test("additionalDetailsRows pairs EDID advertised with Hyprland current", () => {
+  const m = {
+    name: "DP-1",
+    width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0,
+    physicalWidth: 330, physicalHeight: 220,
+    refreshRate: 60, currentFormat: "XRGB8888",
+    colorManagementPreset: "srgb", vrr: false,
+    hardwareDetails: { hdr: true, bt2020: true, vrrCapable: false }
+  }
+  const edid = {
+    bitDepth: 10, srgbDefault: true, hdrStatic: true, year: 2025, week: 20,
+    mfgId: "BOE", productCode: 9558, rangeHz: { min: 40, max: 65 },
+    audio: [{ format: "LPCM", channels: 2 }]
+  }
+  const rows = Object.fromEntries(Model.additionalDetailsRows(m, edid).map(r => [r.label, r]))
+  assert.equal(rows["Bit depth"].current, "8-bit")
+  assert.equal(rows["Bit depth"].advertised, "10-bit")
+  assert.equal(rows.HDR.current, "Off")
+  assert.equal(rows.HDR.advertised, "Capable")
+  assert.equal(rows["Color space"].current, "sRGB")
+  assert.equal(rows["Color space"].advertised, "BT.2020")
+  assert.equal(rows.Refresh.current, "60 Hz")
+  assert.equal(rows.Refresh.advertised, "40–65 Hz")
+  assert.equal(rows.Audio.advertised, "2ch LPCM")
+  assert.equal(rows.Made.advertised, "Week 20, 2025")
+  assert.equal(rows["Product code"].advertised, "BOE 0x2556")
+  assert.equal(Model.additionalDetailsRows({ name: "persistent-miracast", miracast: true }, edid).length, 0)
+})
+
+test("DP stays DP unless Type-C sysfs marks the connector usb", () => {
+  const hdmi = { ...ultrawide, name: "HDMI-A-1", make: "AOC", model: "Display" }
+  const usb1 = { ...portrait, name: "DP-1", make: "BOE", model: "Display", description: "BOE Display L56051794302", portKind: "usb" }
+  const usb2 = { ...portrait, name: "DP-2", make: "BOE", model: "Display", description: "BOE Display other", x: 3840, portKind: "usb" }
+  const fullDp = { ...portrait, name: "DP-3", make: "Dell Inc.", model: "DELL P2419H", x: 5760 }
+  const list = Model.withPortKinds([laptop, usb1, usb2, hdmi, fullDp], { "DP-1": "usb", "DP-2": "usb", "DP-3": "dp", "HDMI-A-1": "hdmi" })
+  assert.equal(Model.tileLabel(usb1, list), "BOE Display")
+  assert.equal(Model.tilePort(list[1]), "(USB-1)")
+  assert.equal(Model.tilePort(list[2]), "(USB-2)")
+  assert.equal(Model.tilePort(list[3]), "(HDMI-1)")
+  assert.equal(Model.tilePort(list[4]), "(DP-3)")
+  assert.equal(Model.tilePort({ name: "persistent-miracast" }), "(Virtual)")
   const tiles = Model.tilesFromMonitors(list)
-  assert.deepEqual(
-    Object.fromEntries(tiles.map(t => [t.name, t.label])),
-    { "eDP-1": "Built-in", "DP-1": "USB-C 1", "DP-2": "USB-C 2", "HDMI-A-1": "HDMI 1" }
-  )
+  const byName = Object.fromEntries(tiles.map(t => [t.name, t]))
+  assert.equal(byName["eDP-1"].port, "(eDP-1)")
+  assert.equal(byName["DP-1"].port, "(USB-1)")
+  assert.equal(byName["DP-2"].port, "(USB-2)")
+  assert.equal(byName["HDMI-A-1"].port, "(HDMI-1)")
+  assert.equal(byName["DP-3"].port, "(DP-3)")
 })
 
 // Desktop: two identical monitors, no built-in panel.
@@ -179,7 +220,8 @@ const dell = (name, x, serial) => ({
 
 test("desktop: identical models get distinct labels and keys", () => {
   const tiles = Model.tilesFromMonitors([dell("DP-1", 0, "S1"), dell("DP-2", 1920, "S2")])
-  assert.deepEqual(tiles.map(t => t.label), ["DisplayPort 1", "DisplayPort 2"])
+  assert.deepEqual(tiles.map(t => t.label), ["DELL P2419H", "DELL P2419H"])
+  assert.deepEqual(tiles.map(t => t.port), ["(DP-1)", "(DP-2)"])
   assert.deepEqual(tiles.map(t => t.key), ["Dell Inc. DELL P2419H S1", "Dell Inc. DELL P2419H S2"])
   assert.ok(tiles.every(t => !t.internal))
 })
@@ -407,6 +449,8 @@ test("dropIndex handles three tiles and zero offset", () => {
 test("cleanSettings keeps only valid fields and normalizes scale", () => {
   assert.deepEqual(Model.cleanSettings({ mode: "3440x1440@99.98", scale: 1.256, transform: 1, vrr: 1 }),
     { mode: "3440x1440@99.98", scale: 1.26, transform: 1, vrr: 1 })
+  assert.deepEqual(Model.cleanSettings({ bitdepth: 10, cm: "hdr" }), { bitdepth: 10, cm: "hdr" })
+  assert.deepEqual(Model.cleanSettings({ bitdepth: 12, cm: "nope" }), {})
   assert.deepEqual(Model.cleanSettings({ mode: "3440x1440@60" }), { mode: "3440x1440@60" })
 })
 
@@ -500,10 +544,10 @@ test("refreshOptions dedupes by formatted value and sorts highest first", () => 
 })
 
 test("liveSettings reads a hyprctl monitor object", () => {
-  assert.deepEqual(Model.liveSettings({ width: 3440, height: 1440, refreshRate: 99.982, scale: 1.25, transform: 1, vrr: true }),
-    { mode: "3440x1440@99.98", scale: 1.25, transform: 1, vrr: 1 })
+  assert.deepEqual(Model.liveSettings({ width: 3440, height: 1440, refreshRate: 99.982, scale: 1.25, transform: 1, vrr: true, currentFormat: "XRGB8888", colorManagementPreset: "srgb" }),
+    { mode: "3440x1440@99.98", scale: 1.25, transform: 1, vrr: 1, bitdepth: 8, cm: "srgb" })
   assert.deepEqual(Model.liveSettings({ width: 1920, height: 1080, refreshRate: 60, scale: 1, transform: 0, vrr: false }),
-    { mode: "1920x1080@60", scale: 1, transform: 0, vrr: 0 })
+    { mode: "1920x1080@60", scale: 1, transform: 0, vrr: 0, bitdepth: 8, cm: "srgb" })
 })
 
 test("settingsMatch compares only the fields present in settings", () => {
@@ -531,6 +575,8 @@ test("settingsMatch treats vrr 2 (fullscreen-only) as always matching", () => {
 test("settingsRule emits fields in a fixed order and escapes the output name", () => {
   assert.equal(Model.settingsRule("HDMI-A-1", { vrr: 1, mode: "3440x1440@99.98", transform: 1, scale: 1.25 }),
     'hl.monitor({ output = "HDMI-A-1", mode = "3440x1440@99.98", scale = 1.25, transform = 1, vrr = 1 })')
+  assert.equal(Model.settingsRule("DP-1", { bitdepth: 10, cm: "hdr" }),
+    'hl.monitor({ output = "DP-1", bitdepth = 10, cm = "hdr" })')
   assert.match(Model.settingsRule('a"b', { mode: "1920x1080@60" }), /output = "a\\"b"/)
   assert.equal(Model.settingsRule("HDMI-A-1", {}), "")
   assert.equal(Model.settingsRule("HDMI-A-1", null), "")
@@ -618,10 +664,12 @@ test("tilesFromMonitors sorts by position and exposes keys", () => {
 })
 
 test("rejectedFields names the settings the display did not take", () => {
-  const monitor = { width: 3440, height: 1440, refreshRate: 99.982, scale: 1, transform: 0, vrr: false }
+  const monitor = { width: 3440, height: 1440, refreshRate: 99.982, scale: 1, transform: 0, vrr: false, currentFormat: "XRGB8888", colorManagementPreset: "srgb" }
   assert.deepEqual(Model.rejectedFields(monitor, { mode: "3440x1440@99.98", scale: 1 }), [])
   assert.deepEqual(Model.rejectedFields(monitor, { mode: "2560x1080@60", scale: 1.25, vrr: 1 }), ["mode", "scale", "vrr"])
   assert.deepEqual(Model.rejectedFields(monitor, { transform: 0, vrr: 2 }), [])
+  assert.deepEqual(Model.rejectedFields(monitor, { bitdepth: 10, cm: "wide" }), ["bitdepth", "cm"])
+  assert.deepEqual(Model.rejectedFields(monitor, { bitdepth: 8, cm: "srgb" }), [])
   assert.deepEqual(Model.rejectedFields(monitor, null), [])
 })
 

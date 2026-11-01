@@ -120,11 +120,12 @@ function withSavedGeometry(monitor, shared, monitorSettings) {
   return copy
 }
 
-// DRM connector kind + 1-based index from the Hyprland output name
-// (eDP-1, DP-2, HDMI-A-1). Index is the firmware connector number, so
-// USB-C 1 stays USB-C 1 whichever panel is plugged in.
-function connectorInfo(name) {
-  var n = String(name || "")
+// DRM connector kind + the index Hyprland already reports (HDMI-A-1 → 1,
+// DP-2 → 2). USB-C DP-alt still shows up as DP-N; `monitor.portKind` is
+// "usb" when Type-C sysfs says so (see bin/identify-display-port-types).
+function connectorInfo(monitor) {
+  var n = typeof monitor === "string" ? monitor : String((monitor && monitor.name) || "")
+  var hint = (monitor && typeof monitor === "object") ? String(monitor.portKind || "") : ""
   var m
   if (VIRTUAL_OUTPUT.test(n) || n.indexOf("HEADLESS-") === 0)
     return { kind: "miracast", index: 0 }
@@ -133,7 +134,10 @@ function connectorInfo(name) {
   m = n.match(/^HDMI(?:-[AB])?-(\d+)$/i)
   if (m) return { kind: "hdmi", index: +m[1] }
   m = n.match(/^(?:DP|DisplayPort)-(\d+)$/i)
-  if (m) return { kind: "dp", index: +m[1] }
+  if (m) {
+    if (hint === "usb") return { kind: "usb", index: +m[1] }
+    return { kind: "dp", index: +m[1] }
+  }
   m = n.match(/^DVI-[DI]-(\d+)$/i)
   if (m) return { kind: "dvi", index: +m[1] }
   m = n.match(/^VGA-(\d+)$/i)
@@ -141,36 +145,209 @@ function connectorInfo(name) {
   return { kind: "other", index: 0 }
 }
 
-function hasInternalPanel(monitors) {
+function withPortKinds(monitors, kinds) {
+  var map = kinds || {}
+  var list = []
   for (var i = 0; i < (monitors || []).length; i++) {
-    if (isInternal(monitors[i])) return true
+    var src = monitors[i]
+    var copy = {}
+    for (var k in src) copy[k] = src[k]
+    var name = String(src.name || "")
+    if (map[name]) copy.portKind = map[name]
+    list.push(copy)
   }
-  return false
+  return list
 }
 
-// Laptop iGPUs expose USB-C DP-alt as DP-N (no full-size DisplayPort).
-function dpIsUsbC(monitors) {
-  return hasInternalPanel(monitors)
-}
-
-// Port-facing name: "Built-in", "USB-C 1", "HDMI 1", "Miracast".
-// Prefer this over EDID model: cheap panels report model "Display".
-function portLabel(monitor, monitors) {
-  var info = connectorInfo(monitor && monitor.name)
+function portCode(monitor, monitors) {
+  var info = connectorInfo(monitor)
   var n = info.index
   switch (info.kind) {
-    case "builtin": return "Built-in"
-    case "miracast": return "Miracast"
-    case "hdmi": return "HDMI " + n
-    case "dp": return (dpIsUsbC(monitors) ? "USB-C " : "DisplayPort ") + n
-    case "dvi": return "DVI " + n
-    case "vga": return "VGA " + n
+    case "builtin": return "eDP-" + n
+    case "miracast": return "Virtual"
+    case "hdmi": return "HDMI-" + n
+    case "usb": return "USB-" + n
+    case "dp": return "DP-" + n
+    case "dvi": return "DVI-" + n
+    case "vga": return "VGA-" + n
     default: return String((monitor && monitor.name) || "Display")
   }
 }
 
-function tileLabel(monitor, monitors) {
-  return portLabel(monitor, monitors)
+var TILE_NAME_MAX = 18
+
+function truncateLabel(text, max) {
+  max = max == null ? TILE_NAME_MAX : max
+  var s = String(text || "").trim()
+  if (s.length <= max) return s
+  if (max <= 1) return "…"
+  return s.slice(0, max - 1) + "…"
+}
+
+function isGenericModel(model) {
+  var m = String(model || "").trim()
+  if (m === "") return true
+  if (/^(Display|Monitor|Unknown|LCD)$/i.test(m)) return true
+  if (/^0x[0-9a-f]+$/i.test(m)) return true
+  return false
+}
+
+// kris-1 tileLabel: model, else the description's first words, else the
+// output name. Extended to skip generic EDID "Display" / hex models, keep
+// the vendor, and name virtual heads Miracast.
+function tileLabel(monitor, monitors, max) {
+  var name
+  if (isVirtualHead(monitor)) {
+    name = "Miracast"
+  } else {
+    var make = String((monitor && monitor.make) || "").trim()
+    var model = String((monitor && monitor.model) || "").trim()
+    make = make.replace(/\s+(Inc\.?|Corporation|Corp\.?|Ltd\.?|Co\.?|Limited)\.?$/i, "").trim()
+    if (!isGenericModel(model)) {
+      var brand = make.split(/\s+/)[0] || ""
+      if (brand && model.toLowerCase().indexOf(brand.toLowerCase()) !== 0)
+        name = brand + " " + model
+      else
+        name = model
+    } else if (make && model && !/^0x[0-9a-f]+$/i.test(model)) {
+      name = (make + " " + model).trim()
+    } else if (make) {
+      name = make
+    } else {
+      var words = description(monitor).split(/\s+/).filter(function(word) { return word !== "" })
+      name = words.length ? words.slice(0, 2).join(" ") : String((monitor && monitor.name) || "Display")
+    }
+  }
+  return truncateLabel(name, max)
+}
+
+function tilePort(monitor, monitors) {
+  return "(" + portCode(monitor, monitors) + ")"
+}
+
+function formatCurrentBitDepth(format) {
+  var f = String(format || "")
+  if (/10|2101010|P010/i.test(f) && !/8888/.test(f)) return "10-bit"
+  if (/8888|RGB888/i.test(f)) return "8-bit"
+  return ""
+}
+
+function formatAudio(audio) {
+  if (!audio || !audio.length) return ""
+  var a = audio[0]
+  var ch = a.channels ? (a.channels + "ch") : ""
+  var fmt = a.format || ""
+  return [ch, fmt].filter(Boolean).join(" ")
+}
+
+function formatColorPreset(preset) {
+  var p = String(preset || "").trim()
+  if (p === "") return ""
+  if (CM_PRESETS[p]) return CM_PRESETS[p]
+  if (p.toLowerCase() === "srgb") return "sRGB"
+  if (p.toLowerCase() === "hdr") return "HDR"
+  return p.charAt(0).toUpperCase() + p.slice(1)
+}
+
+// Hyprland hl.monitor cm= values (wiki: Colors and colorspaces).
+var CM_PRESETS = {
+  auto: "Auto",
+  srgb: "sRGB",
+  dp3: "Display P3",
+  dcip3: "DCI-P3",
+  adobe: "Adobe RGB",
+  wide: "Wide",
+  edid: "EDID",
+  hdr: "HDR",
+  hdredid: "HDR (EDID)"
+}
+
+function liveBitdepth(monitor) {
+  return formatCurrentBitDepth((monitor && monitor.currentFormat) || "") === "10-bit" ? 10 : 8
+}
+
+function liveCm(monitor) {
+  var cm = String((monitor && monitor.colorManagementPreset) || "srgb")
+  return CM_PRESETS[cm] ? cm : "srgb"
+}
+
+function isHdrPreset(cm) {
+  return cm === "hdr" || cm === "hdredid"
+}
+
+function bitdepthOptions() {
+  return [
+    { value: "8", label: "8-bit" },
+    { value: "10", label: "10-bit" }
+  ]
+}
+
+function colorSpaceOptions() {
+  return [
+    { value: "auto", label: "Auto" },
+    { value: "srgb", label: "sRGB" },
+    { value: "dp3", label: "Display P3" },
+    { value: "dcip3", label: "DCI-P3" },
+    { value: "adobe", label: "Adobe RGB" },
+    { value: "wide", label: "Wide" },
+    { value: "edid", label: "EDID" }
+  ]
+}
+
+function hdrOptions() {
+  return [
+    { value: "0", label: "Off" },
+    { value: "1", label: "On" }
+  ]
+}
+
+// Rows for ADDITIONAL DETAILS: { label, current, advertised }.
+// current = Hyprland; advertised = EDID/CTA. Matching values collapse
+// to current only. Virtual heads: [].
+function additionalDetailsRows(monitor, edid) {
+  if (!monitor || isVirtualHead(monitor)) return []
+  edid = edid || {}
+  var hw = monitor.hardwareDetails || {}
+  var rows = []
+  function push(label, current, advertised) {
+    current = current ? String(current) : ""
+    advertised = advertised ? String(advertised) : ""
+    if (current && advertised && current === advertised) advertised = ""
+    if (!current && !advertised) return
+    rows.push({ label: label, current: current, advertised: advertised })
+  }
+  push("Bit depth", formatCurrentBitDepth(monitor.currentFormat), edid.bitDepth ? (edid.bitDepth + "-bit") : "")
+  var panelColor = hw.bt2020 ? "BT.2020" : (edid.srgbDefault ? "sRGB" : "")
+  push("Color space", formatColorPreset(monitor.colorManagementPreset), panelColor)
+  var hdrCap = !!(edid.hdrStatic || hw.hdr)
+  var hdrNow = formatColorPreset(monitor.colorManagementPreset)
+  if (hdrCap) push("HDR", (hdrNow && hdrNow !== "sRGB") ? hdrNow : "Off", "Capable")
+  var vrrNow = monitor.vrr === true || monitor.vrr === 1 ? "On"
+    : monitor.vrr === 2 ? "Fullscreen" : "Off"
+  if (hw.vrrCapable === true) push("VRR", vrrNow, "Capable")
+  else if (monitor.vrr) push("VRR", vrrNow, "")
+  var range = edid.rangeHz
+  var panelHz = (range && range.min && range.max) ? (range.min + "–" + range.max + " Hz") : ""
+  var hz = Number(monitor.refreshRate)
+  var nowHz = isFinite(hz) && hz > 0 ? (Math.round(hz) + " Hz") : ""
+  push("Refresh", nowHz, panelHz)
+  push("Audio", "", formatAudio(edid.audio))
+  if (edid.year)
+    push("Made", "", edid.week ? ("Week " + edid.week + ", " + edid.year) : String(edid.year))
+  if (edid.mfgId && edid.productCode != null) {
+    var hex = "0x" + Number(edid.productCode).toString(16).toUpperCase()
+    push("Product code", "", edid.mfgId + " " + hex)
+  }
+  push("Pixel format", monitor.currentFormat || "", "")
+  var size = logicalSize(monitor)
+  if (size.w > 0) push("Workspace", size.w + " × " + size.h, "")
+  var inches = diagonalInches(monitor.physicalWidth, monitor.physicalHeight)
+  var ppi = pixelDensity(monitor.width, monitor.height, monitor.physicalWidth, monitor.physicalHeight)
+  var dens = []
+  if (inches > 0) dens.push(inches + "″")
+  if (ppi > 0) dens.push(ppi + " PPI")
+  push("Size", dens.join(" · "), "")
+  return rows
 }
 
 // Keeps only the fields of a per-monitor settings entry that are valid,
@@ -195,6 +372,13 @@ function cleanSettings(obj) {
     var vrr = Number(obj.vrr)
     if (Number.isInteger(vrr) && vrr >= 0 && vrr <= 2) result.vrr = vrr
   }
+
+  if (obj.bitdepth !== undefined && obj.bitdepth !== null) {
+    var depth = Number(obj.bitdepth)
+    if (depth === 8 || depth === 10) result.bitdepth = depth
+  }
+
+  if (typeof obj.cm === "string" && CM_PRESETS[obj.cm]) result.cm = obj.cm
 
   return result
 }
@@ -430,7 +614,9 @@ function liveSettings(monitor) {
     mode: modeString(Number(monitor.width) || 0, Number(monitor.height) || 0, Number(monitor.refreshRate) || 0),
     scale: Math.round(scale * 100) / 100,
     transform: Number(monitor.transform) || 0,
-    vrr: monitor.vrr ? 1 : 0
+    vrr: monitor.vrr ? 1 : 0,
+    bitdepth: liveBitdepth(monitor),
+    cm: liveCm(monitor)
   }
 }
 
@@ -464,13 +650,21 @@ function settingsMatch(monitor, settings) {
     // vrr === 2: always matches.
   }
 
+  if (settings.bitdepth !== undefined) {
+    if (liveBitdepth(monitor) !== Number(settings.bitdepth)) return false
+  }
+
+  if (settings.cm !== undefined) {
+    if (liveCm(monitor) !== String(settings.cm)) return false
+  }
+
   return true
 }
 
 // Fields of `settings` the live `monitor` does not show after they were
 // applied, i.e. the ones Hyprland refused or replaced. [] when all took.
 function rejectedFields(monitor, settings) {
-  var fields = ["mode", "scale", "transform", "vrr"]
+  var fields = ["mode", "scale", "transform", "vrr", "bitdepth", "cm"]
   return fields.filter(function(field) {
     if (!settings || settings[field] === undefined) return false
     var one = {}
@@ -489,6 +683,8 @@ function settingsRule(name, settings) {
   if (settings.scale !== undefined) parts.push("scale = " + settings.scale)
   if (settings.transform !== undefined) parts.push("transform = " + settings.transform)
   if (settings.vrr !== undefined) parts.push("vrr = " + settings.vrr)
+  if (settings.bitdepth !== undefined) parts.push("bitdepth = " + settings.bitdepth)
+  if (settings.cm !== undefined) parts.push("cm = " + luaString(settings.cm))
   if (parts.length === 1) return ""
   return "hl.monitor({ " + parts.join(", ") + " })"
 }
@@ -543,7 +739,9 @@ function snapshotPhysicalSettings(monitors, layout) {
       mode: prev.mode !== undefined ? prev.mode : live.mode,
       scale: prev.scale !== undefined ? prev.scale : live.scale,
       transform: prev.transform !== undefined ? prev.transform : live.transform,
-      vrr: prev.vrr !== undefined ? prev.vrr : live.vrr
+      vrr: prev.vrr !== undefined ? prev.vrr : live.vrr,
+      bitdepth: prev.bitdepth !== undefined ? prev.bitdepth : live.bitdepth,
+      cm: prev.cm !== undefined ? prev.cm : live.cm
     })
   }
   return {
@@ -591,6 +789,10 @@ function physicalReloadLua(monitors, layout) {
     parts.push("transform = " + transform)
     var vrr = prev.vrr !== undefined ? prev.vrr : live.vrr
     if (vrr !== undefined) parts.push("vrr = " + vrr)
+    var bitdepth = prev.bitdepth !== undefined ? prev.bitdepth : live.bitdepth
+    if (bitdepth !== undefined) parts.push("bitdepth = " + bitdepth)
+    var cm = prev.cm !== undefined ? prev.cm : live.cm
+    if (cm) parts.push("cm = " + luaString(cm))
     lines.push("hl.monitor({ " + parts.join(", ") + " })")
   }
   return lines.join("\n") + "\n"
@@ -1208,22 +1410,17 @@ function tilesFromMonitors(monitors, stack, monitorSettings, order) {
   var active = activeStack(monitors, stack)
   var previewable = (monitors || []).filter(isPreviewable)
   var shared = sharedDescriptions(previewable.filter(isPackable))
-  var labelCount = {}
-  previewable.forEach(function(monitor) {
-    var label = tileLabel(monitor, previewable)
-    labelCount[label] = (labelCount[label] || 0) + 1
-  })
   var list = previewable.map(function(monitor) {
     var geom = isVirtualHead(monitor) ? monitor : withSavedGeometry(monitor, shared, monitorSettings)
     var size = logicalSize(geom)
-    var label = tileLabel(monitor, previewable)
     var virtual = isVirtualHead(monitor)
     var key = virtual ? String(monitor.name) : monitorKey(monitor, shared)
     var slot = byName[String(monitor.name)]
     return {
       name: String(monitor.name),
       key: key,
-      label: labelCount[label] > 1 ? label + " · " + monitor.name : label,
+      label: tileLabel(monitor, previewable),
+      port: tilePort(monitor, previewable),
       internal: isInternal(monitor),
       virtual: virtual,
       focused: monitor.focused === true,
@@ -1430,7 +1627,17 @@ if (typeof module !== "undefined") {
     sharedDescriptions: sharedDescriptions,
     isInternal: isInternal,
     connectorInfo: connectorInfo,
-    portLabel: portLabel,
+    withPortKinds: withPortKinds,
+    portCode: portCode,
+    truncateLabel: truncateLabel,
+    tilePort: tilePort,
+    additionalDetailsRows: additionalDetailsRows,
+    liveBitdepth: liveBitdepth,
+    liveCm: liveCm,
+    isHdrPreset: isHdrPreset,
+    colorSpaceOptions: colorSpaceOptions,
+    bitdepthOptions: bitdepthOptions,
+    hdrOptions: hdrOptions,
     isVirtualHead: isVirtualHead,
     isParkedVirtual: isParkedVirtual,
     isPreviewable: isPreviewable,
