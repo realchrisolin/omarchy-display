@@ -929,6 +929,7 @@ class WlrootsMixin:
                 "-P", f"media.name={audio_monitor}",
                 "-P", "media.role=Abstract",
                 "-P", "media.category=Capture",
+                "-P", "stream.capture.sink=true",
                 "-P", f"target.object={audio_monitor}",
                 "-",
             ]
@@ -942,6 +943,7 @@ class WlrootsMixin:
             "--format=s16le",
             "--raw",
             "--property=media.role=Abstract",
+            "--property=stream.capture.sink=true",
             f"--property=module-stream-restore.id=fluxcast-wfd:{audio_monitor}",
         ]
 
