@@ -354,7 +354,16 @@ Panel {
     return Model.brightnessName(percent)
   }
 
+  function applyDisplayRows(rows) {
+    root.displays = rows.displays
+    root.enabledDisplayCount = rows.enabledDisplayCount
+  }
+
   function updateDisplays(displaysJson) {
+    if (arrangement.monitors && arrangement.monitors.length) {
+      applyDisplayRows(LayoutModel.displayRows(arrangement.monitors))
+      return
+    }
     var parsed = Model.parseDisplays(displaysJson)
     var list = []
     var count = 0
@@ -374,9 +383,28 @@ Panel {
 
   function toggleDisplay(name, enabled) {
     if (!name) return
-    if (enabled && root.enabledDisplayCount <= 1) return
+    for (var i = 0; i < root.displays.length; i++) {
+      if (root.displays[i] && root.displays[i].name === name && root.displays[i].connected === false)
+        return
+    }
+    var tile = null
+    for (var t = 0; t < arrangement.tiles.length; t++) {
+      if (arrangement.tiles[t] && arrangement.tiles[t].name === name) {
+        tile = arrangement.tiles[t]
+        break
+      }
+    }
+    var countsAsPicture = !tile || (!tile.parked && tile.connected !== false)
+    if (enabled && countsAsPicture && root.enabledDisplayCount <= 1) return
 
-    var command = Model.displayToggleCommand(name, enabled, root.internalMonitor)
+    var command = null
+    if (LayoutModel.isVirtualHead({ name: name }) && !enabled) {
+      var phase = (miracastSection.service && miracastSection.service.phase) || ""
+      var streaming = phase === "streaming" || phase === "rtsp"
+      command = Model.miracastEnableCommand(name, streaming, root.pluginBin + "/miracast-ctl")
+    } else {
+      command = Model.displayToggleCommand(name, enabled, root.internalMonitor)
+    }
     if (!command) return
 
     // toggle: one switch at a time. A running actionProc would not pick up the
@@ -755,6 +783,8 @@ Panel {
               root.cursorActive = true
               root.focusSection = "arrangement"
             }
+            onMonitorsChanged: root.applyDisplayRows(LayoutModel.displayRows(arrangement.monitors))
+            onDisplayToggleRequested: function(name, enabled) { root.toggleDisplay(name, enabled) }
           }
 
           PanelSeparator {
@@ -1063,7 +1093,7 @@ Panel {
     required property int rowIndex
 
     readonly property bool isFocused: display && display.focused
-    readonly property bool canToggle: display && (!display.enabled || root.enabledDisplayCount > 1)
+    readonly property bool canToggle: display && display.connected !== false && (!display.enabled || root.enabledDisplayCount > 1)
     readonly property var tagged: LayoutModel.withPortKinds([display], arrangement.portKinds)[0]
 
     hasCursor: root.cursorActive && root.focusSection === "monitors" && root.selectedIndex === rowIndex
@@ -1112,7 +1142,12 @@ Panel {
 
         Text {
           textFormat: Text.PlainText
-          text: LayoutModel.tilePort(monitorRow.tagged, root.displays) + (monitorRow.display.focused ? " · focused" : "")
+          text: (monitorRow.display.connected === false
+            ? (LayoutModel.tilePort(monitorRow.tagged, root.displays) + " · disconnected")
+            : (!monitorRow.display.enabled
+              ? (LayoutModel.tilePort(monitorRow.tagged, root.displays) + " · disabled")
+              : LayoutModel.tilePort(monitorRow.tagged, root.displays)))
+            + (monitorRow.display.focused ? " · focused" : "")
           color: Qt.darker(root.bar.foreground, 1.4)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption

@@ -1125,7 +1125,7 @@ PanelWindow {
             ActionButton {
               col: 1
               text: "Apply"
-              enabled: root.dirty && !root.trying
+              enabled: root.dirty && !root.trying && root.monitor && root.monitor.connected !== false
               active: enabled
               onClicked: root.tryChanges()
             }

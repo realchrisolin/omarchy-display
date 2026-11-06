@@ -65,8 +65,19 @@ function isParkedVirtual(monitor) {
 // live) so DISPLAY SETTINGS can place it. Layout apply still uses isArrangeable
 // only; place-virtual-head owns the real output.
 function isPreviewable(monitor) {
+  if (!monitor) return false
+  if (monitor.connected === false) {
+    var dw = Number(monitor.width) || 0
+    var dh = Number(monitor.height) || 0
+    return dw > 0 && dh > 0
+  }
   if (isArrangeable(monitor)) return true
-  if (!isVirtualHead(monitor)) return false
+  if (!isVirtualHead(monitor)) {
+    // Connected but software-disabled: still a head (wlr enabled=0).
+    var pw = Number(monitor.width) || 0
+    var ph = Number(monitor.height) || 0
+    return pw > 0 && ph > 0
+  }
   var w = Number(monitor.width) || 0
   var h = Number(monitor.height) || 0
   return w > 0 && h > 0
@@ -94,6 +105,7 @@ function isArrangeable(monitor) {
 }
 
 function isPackable(monitor) {
+  if (monitor && monitor.connected === false) return isPreviewable(monitor)
   return isArrangeable(monitor) || (isVirtualHead(monitor) && isPreviewable(monitor))
 }
 
@@ -548,6 +560,102 @@ function extendCommands() {
 
 // Parses "3440x1440@99.98Hz", "3440x1440@99.98" or "1920x1080" (refresh 0
 // when absent). Returns null when `str` does not look like a mode.
+function isLayoutVirtualKey(key) {
+  var k = String(key || "")
+  if (VIRTUAL_OUTPUT.test(k)) return true
+  if (k.indexOf("HEADLESS-") === 0) return true
+  if (k === "Miracast") return true
+  return false
+}
+
+function stubSize(saved) {
+  var parsed = parseMode(saved && saved.mode)
+  if (parsed && parsed.width > 0 && parsed.height > 0)
+    return { width: parsed.width, height: parsed.height }
+  return { width: 1920, height: 1080 }
+}
+
+// Live heads plus remembered physical identities from monitor-layout.json.
+// Unplugged keys stay in JSON (snapshotPhysicalSettings); hyprctl drops them.
+function mergeKnownMonitors(live, layout) {
+  var list = []
+  var seen = {}
+  var shared = sharedDescriptions(live || [])
+  var i
+  for (i = 0; i < (live || []).length; i++) {
+    var m = live[i]
+    if (!m) continue
+    var copy = {}
+    for (var f in m) copy[f] = m[f]
+    copy.connected = true
+    if (copy.enabled === undefined) copy.enabled = isPresenting(m)
+    list.push(copy)
+    seen[monitorKey(m, shared)] = true
+    if (m.name) seen[String(m.name)] = true
+  }
+  var order = (layout && layout.order) || []
+  var saved = (layout && layout.monitors) || {}
+  var keys = []
+  for (i = 0; i < order.length; i++) {
+    if (keys.indexOf(order[i]) < 0) keys.push(order[i])
+  }
+  for (var k in saved) {
+    if (Object.prototype.hasOwnProperty.call(saved, k) && keys.indexOf(k) < 0)
+      keys.push(k)
+  }
+  for (i = 0; i < keys.length; i++) {
+    var key = keys[i]
+    if (!key || isLayoutVirtualKey(key) || seen[key]) continue
+    var size = stubSize(saved[key])
+    var scale = saved[key] && Number(saved[key].scale) > 0 ? Number(saved[key].scale) : 1
+    list.push({
+      name: key,
+      description: key,
+      width: size.width,
+      height: size.height,
+      refreshRate: 0,
+      scale: scale,
+      transform: saved[key] && saved[key].transform !== undefined ? saved[key].transform : 0,
+      x: 0,
+      y: 0,
+      focused: false,
+      disabled: true,
+      enabled: false,
+      connected: false,
+      mirrorOf: "none"
+    })
+  }
+  return list
+}
+
+// DISPLAYS rows from merged hyprctl heads. Virtual heads stay out of the
+// toggle list (same as DisplayPanel.updateDisplays) but still count when live.
+function displayRows(monitors) {
+  var list = []
+  var count = 0
+  for (var i = 0; i < (monitors || []).length; i++) {
+    var m = monitors[i]
+    if (!m) continue
+    if (isVirtualHead(m)) {
+      if (!isParkedVirtual(m) && isPresenting(m)) count++
+      continue
+    }
+    var connected = m.connected !== false
+    var enabled = connected && isPresenting(m)
+    if (enabled) count++
+    list.push({
+      name: String(m.name || ""),
+      description: String(m.description || m.name || ""),
+      enabled: enabled,
+      focused: m.focused === true,
+      width: Number(m.width) || 0,
+      height: Number(m.height) || 0,
+      connected: connected
+    })
+  }
+  return { displays: list, enabledDisplayCount: count }
+}
+
 function parseMode(str) {
   var match = /^(\d+)x(\d+)(?:@(\d+(?:\.\d+)?)(?:Hz)?)?$/i.exec(String(str || "").trim())
   if (!match) return null
@@ -969,6 +1077,7 @@ function computePositions(monitors, order, stack, monitorSettings) {
       name: String(p.monitor.name),
       x: px,
       y: py,
+      connected: p.monitor.connected !== false,
       changed: (Number(p.monitor.x) || 0) !== px || (Number(p.monitor.y) || 0) !== py
     })
   })
@@ -1183,7 +1292,9 @@ function positionRule(name, x, y) {
 // returning monitor appear beside the layout instead.
 function positionsToLua(positions, staging, parked) {
   var lines = []
-  var phys = (positions || []).filter(function(p) { return !isVirtualHead({ name: p.name }) })
+  var phys = (positions || []).filter(function(p) {
+    return !isVirtualHead({ name: p.name }) && p.connected !== false
+  })
   var virt = (positions || []).filter(function(p) { return isVirtualHead({ name: p.name }) })
   if (staging !== undefined && staging !== null) {
     for (var i = 0; i < phys.length; i++)
@@ -1416,13 +1527,23 @@ function tilesFromMonitors(monitors, stack, monitorSettings, order) {
     var virtual = isVirtualHead(monitor)
     var key = virtual ? String(monitor.name) : monitorKey(monitor, shared)
     var slot = byName[String(monitor.name)]
+    var connected = monitor.connected !== false
+    var enabled = connected && isPresenting(monitor)
+    var parked = isParkedVirtual(monitor)
+    var port = tilePort(monitor, previewable)
+    if (!connected) port += " · disconnected"
+    else if (!enabled) port += " · disabled"
+    else if (parked) port += " · disconnected"
     return {
       name: String(monitor.name),
       key: key,
       label: tileLabel(monitor, previewable),
-      port: tilePort(monitor, previewable),
+      port: port,
       internal: isInternal(monitor),
       virtual: virtual,
+      connected: connected,
+      enabled: enabled,
+      parked: parked,
       focused: monitor.focused === true,
       stacked: !!active[key],
       x: slot ? slot.x : (Number(monitor.x) || 0),
@@ -1640,6 +1761,9 @@ if (typeof module !== "undefined") {
     hdrOptions: hdrOptions,
     isVirtualHead: isVirtualHead,
     isParkedVirtual: isParkedVirtual,
+    isLayoutVirtualKey: isLayoutVirtualKey,
+    mergeKnownMonitors: mergeKnownMonitors,
+    displayRows: displayRows,
     isPreviewable: isPreviewable,
     isPresenting: isPresenting,
     isArrangeable: isArrangeable,

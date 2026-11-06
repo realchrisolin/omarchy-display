@@ -929,3 +929,61 @@ test("layoutWithExtendPosition above stacks on the laptop", () => {
   const left = Model.layoutWithExtendPosition(layout, [edp, tv], "left")
   assert.equal(left.order[0], "persistent-miracast")
 })
+
+test("mergeKnownMonitors adds a remembered unplugged display and not a second Miracast", () => {
+  const edp = { name: "eDP-1", description: "Chimei Innolux Corporation 0x14E7", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, focused: true, disabled: false, mirrorOf: "none" }
+  const parked = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: -12000, y: 0, disabled: false, mirrorOf: "none" }
+  const layout = {
+    order: ["Chimei Innolux Corporation 0x14E7", "BOE Display L56051794302", "persistent-miracast"],
+    monitors: {
+      "Chimei Innolux Corporation 0x14E7": { mode: "1920x1080@60", scale: 1 },
+      "BOE Display L56051794302": { mode: "1920x1080@60", scale: 1.5, transform: 2 }
+    }
+  }
+  const merged = Model.mergeKnownMonitors([edp, parked], layout)
+  const stubs = merged.filter(function(m) { return m.connected === false })
+  assert.equal(stubs.length, 1)
+  assert.equal(stubs[0].description, "BOE Display L56051794302")
+  assert.equal(stubs[0].width, 1920)
+  assert.equal(stubs[0].height, 1080)
+  assert.equal(Model.isArrangeable(stubs[0]), false)
+  assert.equal(Model.isPreviewable(stubs[0]), true)
+  const virt = merged.filter(function(m) { return m.name === "persistent-miracast" })
+  assert.equal(virt.length, 1)
+  const lua = Model.physicalReloadLua(merged, layout)
+  assert.equal(lua.indexOf("BOE Display") < 0, true)
+  const tiles = Model.tilesFromMonitors(merged, {}, layout.monitors, layout.order)
+  const boe = tiles.filter(function(t) { return t.key === "BOE Display L56051794302" })[0]
+  assert.ok(boe)
+  assert.equal(boe.connected, false)
+  assert.match(boe.port, /disconnected/)
+})
+
+test("mergeKnownMonitors does not duplicate a live USB-C panel", () => {
+  const edp = { name: "eDP-1", description: "Chimei", width: 1920, height: 1080, scale: 1, transform: 0, x: 0, y: 0, disabled: false, mirrorOf: "none" }
+  const boe = { name: "DP-1", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 2, x: 1920, y: 0, disabled: false, mirrorOf: "none" }
+  const layout = { order: ["Chimei", "BOE Display L56051794302"], monitors: { "BOE Display L56051794302": { mode: "1920x1080@60" } } }
+  const merged = Model.mergeKnownMonitors([edp, boe], layout)
+  assert.equal(merged.filter(function(m) { return m.connected === false }).length, 0)
+  assert.equal(merged.filter(function(m) { return String(m.description).indexOf("BOE") >= 0 }).length, 1)
+})
+
+test("disabled Miracast head is disabled; a parked head stays disconnected", () => {
+  const off = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, disabled: true, connected: true, focused: false, mirrorOf: "none" }
+  const parked = { name: "persistent-miracast", width: 1920, height: 1080, scale: 1, transform: 0, x: -12000, y: 0, disabled: false, dpmsStatus: true, connected: true, focused: false, mirrorOf: "none" }
+  const offTiles = Model.tilesFromMonitors([off], {}, {}, [])
+  assert.equal(offTiles[0].enabled, false)
+  assert.match(offTiles[0].port, /disabled/)
+  const parkedTiles = Model.tilesFromMonitors([parked], {}, {}, [])
+  assert.match(parkedTiles[0].port, /disconnected/)
+  assert.equal(parkedTiles[0].port.indexOf("disabled") >= 0, false)
+})
+
+test("connected but disabled head stays previewable", () => {
+  const off = { name: "DP-1", description: "BOE Display L56051794302", width: 1920, height: 1080, scale: 1, transform: 0, x: 1920, y: 0, disabled: true, connected: true, focused: false, mirrorOf: "none" }
+  assert.equal(Model.isPresenting(off), false)
+  assert.equal(Model.isPreviewable(off), true)
+  assert.equal(Model.isArrangeable(off), false)
+  const tiles = Model.tilesFromMonitors([off], {}, {}, [])
+  assert.match(tiles[0].port, /disabled/)
+})

@@ -111,6 +111,15 @@ function displayToggleCommand(name, enabled, internalMonitor) {
   return ["hyprctl", "eval", displayToggleSpec(name, enabled)]
 }
 
+// Re-enable a Miracast head without position=auto (that stacks on eDP).
+// Live cast: existing place-virtual-head. Idle: clear disabled and stay parked.
+function miracastEnableCommand(name, streaming, ctl) {
+  if (!name) return null
+  if (streaming)
+    return [ctl || "miracast-ctl", "place-virtual-head"]
+  return ["hyprctl", "eval", "hl.monitor({ output = " + quoteLua(name) + ", disabled = false })"]
+}
+
 function parseDisplays(raw) {
   var displays = []
   try {
@@ -569,6 +578,7 @@ if (typeof module !== "undefined") {
     quoteLua: quoteLua,
     displayToggleSpec: displayToggleSpec,
     displayToggleCommand: displayToggleCommand,
+    miracastEnableCommand: miracastEnableCommand,
     parseDisplays: parseDisplays,
     inferExtendPosition: inferExtendPosition,
     miracastPhaseLabel: miracastPhaseLabel,

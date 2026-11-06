@@ -80,6 +80,17 @@ Column {
 
   // Hover asks the host panel to move its keyboard focus here.
   signal focusRequested()
+  // Same action as the DISPLAYS row: DisplayPanel.toggleDisplay.
+  signal displayToggleRequested(string name, bool enabled)
+
+  readonly property int enabledTileCount: {
+    var n = 0
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i]
+      if (tile && tile.enabled && !tile.parked && tile.connected !== false) n++
+    }
+    return n
+  }
 
   Connections {
     target: root.miracast
@@ -304,8 +315,9 @@ Column {
         var monitors = []
         try { monitors = JSON.parse(String(text || "[]")) } catch (e) { monitors = [] }
         monitors = LayoutModel.withPortKinds(monitors, root.portKinds)
-        root.monitors = monitors
         var layout = LayoutModel.migrateLayoutOrder(orderFile.layout, monitors)
+        monitors = LayoutModel.mergeKnownMonitors(monitors, layout)
+        root.monitors = monitors
         if (JSON.stringify(layout.order) !== JSON.stringify(orderFile.layout.order || []))
           orderFile.saveLayout(layout)
         root.tiles = LayoutModel.tilesFromMonitors(
@@ -527,8 +539,10 @@ Column {
           icon: modelData.virtual ? "󰖩" : (modelData.internal ? "󰌢" : "󰍹")
           label: modelData.label
           port: modelData.port || ""
+          // Same 0.45 as the DISPLAYS row when it cannot be the active picture.
+          opacity: modelData.connected === false || modelData.enabled === false ? 0.45 : 1
+          highlighted: modelData.focused && modelData.enabled !== false
           number: index + 1
-          highlighted: modelData.focused
           grabbed: dragged || root.grabbedIndex === index
           hasCursor: root.cursorActive && root.focused && root.selectedIndex === index
           dropSide: canvas.dropSideFor(index)
@@ -576,6 +590,35 @@ Column {
               canvas.dragIndex = -1
               canvas.dragX = 0
               canvas.dragY = 0
+            }
+          }
+
+          // On/Off for a connected head. Same command as DISPLAYS. Not a drag.
+          MouseArea {
+            visible: screenTile.modelData.connected !== false
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(2)
+            width: Style.space(16)
+            height: Style.space(16)
+            z: 3
+            preventStealing: true
+            hoverEnabled: true
+            cursorShape: {
+              var lastOn = screenTile.modelData.enabled && root.enabledTileCount <= 1
+              return lastOn ? Qt.ArrowCursor : Qt.PointingHandCursor
+            }
+            onClicked: {
+              if (screenTile.modelData.enabled && root.enabledTileCount <= 1) return
+              root.displayToggleRequested(screenTile.modelData.name, screenTile.modelData.enabled)
+            }
+
+            Text {
+              anchors.centerIn: parent
+              text: screenTile.modelData.enabled ? "󰄬" : "󰄱"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
         }

@@ -19,6 +19,10 @@ Bar entry is `DisplayPanel.qml` (`Panel.qml` is kept for merging upstream).
 
 ### Changed
 
+- DISPLAY SETTINGS keeps a remembered wired display after it is unplugged,
+  and a connected head after it is turned off. On/Off is the existing display
+  toggle. Miracast off sets `disabled`; on while streaming calls
+  `place-virtual-head`, and while idle only clears `disabled`.
 - DISPLAY SETTINGS tiles show truncated vendor/model on the first line and
   the connector on the second. Type-C DP-alt is `(USB-1)`; a full DisplayPort
   stays `(DP-1)`; HDMI is `(HDMI-1)`. The index is the DRM connector number.

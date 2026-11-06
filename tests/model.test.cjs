@@ -24,6 +24,17 @@ test("displayToggleCommand routes the built-in panel through its own command", (
   assert.equal(Model.displayToggleCommand("", true, "eDP-1"), null)
 })
 
+test("persistent-miracast disables like any other head and does not re-enable at auto", () => {
+  assert.deepEqual(Model.displayToggleCommand("persistent-miracast", true, "eDP-1"),
+    ["hyprctl", "eval", 'hl.monitor({ output = "persistent-miracast", disabled = true })'])
+  var on = Model.miracastEnableCommand("persistent-miracast", false, "/tmp/miracast-ctl")
+  assert.deepEqual(on, ["hyprctl", "eval", 'hl.monitor({ output = "persistent-miracast", disabled = false })'])
+  assert.equal(String(on).indexOf("position") >= 0, false)
+  assert.deepEqual(Model.miracastEnableCommand("persistent-miracast", true, "/tmp/miracast-ctl"),
+    ["/tmp/miracast-ctl", "place-virtual-head"])
+  assert.equal(Model.miracastEnableCommand("", true, "/tmp/miracast-ctl"), null)
+})
+
 test("quoteLua escapes a display name", () => {
   assert.equal(Model.quoteLua('DP"1'), '"DP\\"1"')
   assert.equal(Model.quoteLua('a\\b'), '"a\\\\b"')
