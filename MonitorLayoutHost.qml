@@ -49,6 +49,33 @@ Item {
     }
   }
 
+  // Last hl.device chunk applied. Same plan is not eval'd again.
+  property string touchLuaApplied: ""
+  property string touchLuaPending: ""
+  property string touchLuaQueued: ""
+  property bool touchReadPending: false
+  property bool touchRetried: false
+
+  function bindTouch() {
+    if (!root.singletonOwner) return
+    if (touchRead.running) {
+      touchReadPending = true
+      return
+    }
+    touchRead.running = true
+  }
+
+  function startTouchEval(lua) {
+    if (!lua || lua === root.touchLuaApplied) return
+    if (touchEval.running) {
+      touchLuaQueued = lua
+      return
+    }
+    touchLuaPending = lua
+    touchEval.command = ["hyprctl", "eval", lua]
+    touchEval.running = true
+  }
+
   LayoutApplier {
     id: applier
     orderPath: root.orderPath
@@ -84,6 +111,8 @@ Item {
       case "monitorremoved":
       case "monitorremovedv2":
       case "configreloaded":
+        root.touchRetried = false
+        root.bindTouch()
         settle.restart()
         break
       }
@@ -132,5 +161,53 @@ Item {
     stdout: StdioCollector { waitForEnd: true }
   }
 
-  Component.onCompleted: settle.restart()
+  // HID nodes often appear just after the DRM connector.
+  Timer {
+    id: touchRetry
+    interval: 2000
+    repeat: false
+    onTriggered: root.bindTouch()
+  }
+
+  Process {
+    id: touchRead
+    command: [root.pluginDir + "/bin/bind-touchscreens"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var plan = {}
+        try { plan = JSON.parse(String(text || "")) } catch (e) { plan = {} }
+        root.startTouchEval(String(plan.lua || ""))
+        if (plan.retry === true && !root.touchRetried) {
+          root.touchRetried = true
+          touchRetry.restart()
+        }
+        if (root.touchReadPending) {
+          root.touchReadPending = false
+          root.bindTouch()
+        }
+      }
+    }
+  }
+
+  // hl.device only. Does not move outputs.
+  Process {
+    id: touchEval
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.touchLuaApplied = root.touchLuaPending
+        if (root.touchLuaQueued && root.touchLuaQueued !== root.touchLuaApplied) {
+          var next = root.touchLuaQueued
+          root.touchLuaQueued = ""
+          root.startTouchEval(next)
+        }
+      }
+    }
+  }
+
+  Component.onCompleted: {
+    settle.restart()
+    root.bindTouch()
+  }
 }

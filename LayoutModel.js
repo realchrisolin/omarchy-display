@@ -1742,6 +1742,169 @@ function withDisplayEnabled(displays, name, enabled) {
   return { displays: list, enabledDisplayCount: count }
 }
 
+// Hyprland's device name: lowercase, and space, newline, or comma become "-".
+function hyprDeviceName(kernelName) {
+  return String(kernelName || "").toLowerCase().replace(/[ \n,]/g, "-")
+}
+
+// /proc/bus/input/devices records that have a kernel name and an event node.
+function parseProcInputDevices(text) {
+  var devices = []
+  var current = {}
+  function finish() {
+    if (current.name && current.event)
+      devices.push({ name: current.name, event: current.event })
+    current = {}
+  }
+  var lines = String(text || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line === "") {
+      finish()
+    } else if (line.indexOf("N: Name=") === 0) {
+      var named = /^N: Name="(.*)"$/.exec(line)
+      if (named) current.name = named[1]
+    } else if (line.indexOf("H: Handlers=") === 0) {
+      var event = /event\d+/.exec(line)
+      if (event) current.event = event[0]
+    }
+  }
+  finish()
+  return devices
+}
+
+// udev database lines: E:KEY=value.
+function parseUdevProps(text) {
+  var props = {}
+  var lines = String(text || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var match = /^E:([^=]+)=(.*)$/.exec(lines[i])
+    if (match) props[match[1]] = match[2]
+  }
+  return props
+}
+
+// Touchscreens from proc text plus udev text (or a props object) keyed by event node.
+// ID_INPUT_TOUCHSCREEN is the kernel tag. The touchpad is not included.
+function touchscreensFrom(procText, udevByEvent) {
+  var records = parseProcInputDevices(procText)
+  var map = udevByEvent || {}
+  var out = []
+  for (var i = 0; i < records.length; i++) {
+    var raw = map[records[i].event]
+    var props = typeof raw === "string" ? parseUdevProps(raw) : (raw || {})
+    if (props.ID_INPUT_TOUCHSCREEN !== "1") continue
+    out.push({
+      name: hyprDeviceName(records[i].name),
+      integration: props.ID_INTEGRATION || "",
+      widthMm: Number(props.ID_INPUT_WIDTH_MM) || 0,
+      heightMm: Number(props.ID_INPUT_HEIGHT_MM) || 0
+    })
+  }
+  return out
+}
+
+function monitorMillimeters(monitor) {
+  var w = Number(monitor && (monitor.physicalWidth != null ? monitor.physicalWidth : monitor.physical_width))
+  var h = Number(monitor && (monitor.physicalHeight != null ? monitor.physicalHeight : monitor.physical_height))
+  if (!isFinite(w) || !isFinite(h) || w <= 0 || h <= 0) return null
+  return { w: w, h: h }
+}
+
+// internal: kernel laptop panel. external: a wired head with an EDID size.
+// Headless / Miracast outputs are neither.
+function touchMonitorRole(monitor) {
+  if (!monitor || isVirtualHead(monitor)) return null
+  if (!monitorMillimeters(monitor)) return null
+  if (isInternal(monitor)) return "internal"
+  return "external"
+}
+
+function touchSizeError(tw, th, mw, mh) {
+  if (tw <= 0 || th <= 0 || mw <= 0 || mh <= 0) return null
+  function rel(a, b) { return Math.abs(a - b) / b }
+  var direct = Math.max(rel(tw, mw), rel(th, mh))
+  var swapped = Math.max(rel(tw, mh), rel(th, mw))
+  return swapped < direct ? swapped : direct
+}
+
+// One candidate of the digitizer's class wins. Several candidates use the
+// HID millimeters against the EDID millimeters (axes may be swapped). Within
+// 25%, and only when the next panel is at least 0.05 worse. Otherwise no bind.
+function matchTouchMonitor(touch, monitors) {
+  var want = touch && touch.integration
+  if (want !== "internal" && want !== "external") want = ""
+  var candidates = []
+  for (var i = 0; i < (monitors || []).length; i++) {
+    var role = touchMonitorRole(monitors[i])
+    if (role && (want === "" || role === want)) candidates.push(monitors[i])
+  }
+  if (candidates.length === 1) return candidates[0]
+  if (candidates.length === 0) return null
+  var best = null
+  var bestErr = 0
+  var secondErr = null
+  for (var c = 0; c < candidates.length; c++) {
+    var mm = monitorMillimeters(candidates[c])
+    var err = touchSizeError(touch.widthMm, touch.heightMm, mm.w, mm.h)
+    if (err == null) continue
+    if (!best || err < bestErr) {
+      secondErr = best ? bestErr : secondErr
+      best = candidates[c]
+      bestErr = err
+    } else if (secondErr == null || err < secondErr) {
+      secondErr = err
+    }
+  }
+  if (!best || bestErr > 0.25) return null
+  if (secondErr != null && (secondErr - bestErr) < 0.05) return null
+  return best
+}
+
+function touchBindings(touchscreens, monitors) {
+  var bindings = []
+  for (var i = 0; i < (touchscreens || []).length; i++) {
+    var touch = touchscreens[i]
+    var mon = matchTouchMonitor(touch, monitors)
+    if (!mon || !mon.name) continue
+    var transform = Number(mon.transform)
+    if (!isFinite(transform)) transform = 0
+    bindings.push({
+      name: touch.name,
+      output: String(mon.name),
+      transform: Math.round(transform)
+    })
+  }
+  return bindings
+}
+
+// One hyprctl eval chunk. Starts with return so Hyprland does not wrap it
+// again and drop every statement after the first.
+function touchBindLua(bindings) {
+  if (!bindings || !bindings.length) return ""
+  var lines = ["return (function()"]
+  for (var i = 0; i < bindings.length; i++) {
+    var b = bindings[i]
+    lines.push("  hl.device({ name = " + luaString(b.name) + ", output = " + luaString(b.output) + ", transform = " + b.transform + " })")
+  }
+  lines.push("end)()")
+  return lines.join("\n")
+}
+
+function touchBindPlan(touchscreens, monitors) {
+  var bindings = touchBindings(touchscreens, monitors)
+  var external = 0
+  for (var i = 0; i < (monitors || []).length; i++) {
+    if (touchMonitorRole(monitors[i]) === "external") external++
+  }
+  return {
+    bindings: bindings,
+    lua: touchBindLua(bindings),
+    // DRM often arrives before the USB HID node.
+    retry: bindings.length === 0 && (!touchscreens || touchscreens.length === 0) && external > 0
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     monitorKey: monitorKey,
@@ -1825,6 +1988,15 @@ if (typeof module !== "undefined") {
     layoutWithExtendPosition: layoutWithExtendPosition,
     applyExtendPreview: applyExtendPreview,
     extendPositionFromDrop: extendPositionFromDrop,
+    hyprDeviceName: hyprDeviceName,
+    parseProcInputDevices: parseProcInputDevices,
+    parseUdevProps: parseUdevProps,
+    touchscreensFrom: touchscreensFrom,
+    touchMonitorRole: touchMonitorRole,
+    matchTouchMonitor: matchTouchMonitor,
+    touchBindings: touchBindings,
+    touchBindLua: touchBindLua,
+    touchBindPlan: touchBindPlan,
     withDisplayEnabled: withDisplayEnabled
   }
 }

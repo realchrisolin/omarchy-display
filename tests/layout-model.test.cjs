@@ -987,3 +987,91 @@ test("connected but disabled head stays previewable", () => {
   const tiles = Model.tilesFromMonitors([off], {}, {}, [])
   assert.match(tiles[0].port, /disabled/)
 })
+
+const touchProc = [
+  'N: Name="G2Touch Multi-Touch by G2TSP"',
+  "H: Handlers=event18",
+  "",
+  'N: Name="DELL0A20:00 0488:101A Touchpad"',
+  "H: Handlers=event8",
+  ""
+].join("\n")
+const touchUdev = {
+  event18: [
+    "E:ID_INPUT_TOUCHSCREEN=1",
+    "E:ID_INTEGRATION=external",
+    "E:ID_INPUT_WIDTH_MM=320",
+    "E:ID_INPUT_HEIGHT_MM=180"
+  ].join("\n"),
+  event8: "E:ID_INPUT_TOUCHPAD=1\nE:ID_INTEGRATION=internal\n"
+}
+const touchMonitors = [
+  { name: "eDP-1", physicalWidth: 310, physicalHeight: 170, transform: 0 },
+  { name: "persistent-miracast", physicalWidth: 0, physicalHeight: 0, transform: 0 },
+  { name: "DP-1", physicalWidth: 340, physicalHeight: 190, transform: 2 }
+]
+
+test("touchscreensFrom keeps the external digitizer and drops the touchpad", () => {
+  const screens = Model.touchscreensFrom(touchProc, touchUdev)
+  assert.equal(screens.length, 1)
+  assert.equal(screens[0].name, "g2touch-multi-touch-by-g2tsp")
+  assert.equal(screens[0].integration, "external")
+  assert.equal(screens[0].widthMm, 320)
+  assert.equal(screens[0].heightMm, 180)
+})
+
+test("an external touchscreen binds to the only external panel, with its transform", () => {
+  const screens = Model.touchscreensFrom(touchProc, touchUdev)
+  const plan = Model.touchBindPlan(screens, touchMonitors)
+  assert.equal(plan.retry, false)
+  assert.equal(plan.bindings.length, 1)
+  assert.equal(plan.bindings[0].output, "DP-1")
+  assert.equal(plan.bindings[0].transform, 2)
+  assert.match(plan.lua, /^return \(function\(\)/)
+  assert.match(plan.lua, /output = "DP-1"/)
+  assert.match(plan.lua, /transform = 2/)
+  assert.equal(plan.lua.indexOf("eDP-1") >= 0, false)
+  assert.equal(plan.lua.indexOf("persistent-miracast") >= 0, false)
+})
+
+test("several external panels use HID size against EDID size", () => {
+  const screens = Model.touchscreensFrom(touchProc, touchUdev)
+  const monitors = touchMonitors.concat([
+    { name: "HDMI-A-1", physicalWidth: 800, physicalHeight: 450, transform: 0 }
+  ])
+  const plan = Model.touchBindPlan(screens, monitors)
+  assert.equal(plan.bindings[0].output, "DP-1")
+})
+
+test("two similar panels are left unbound", () => {
+  const screens = Model.touchscreensFrom(touchProc, touchUdev)
+  const monitors = [
+    { name: "DP-1", physicalWidth: 340, physicalHeight: 190, transform: 0 },
+    { name: "DP-2", physicalWidth: 345, physicalHeight: 194, transform: 0 }
+  ]
+  const plan = Model.touchBindPlan(screens, monitors)
+  assert.equal(plan.bindings.length, 0)
+  assert.equal(plan.lua, "")
+})
+
+test("an internal touchscreen binds to the laptop panel", () => {
+  const screens = [{ name: "internal-touch", integration: "internal", widthMm: 310, heightMm: 170 }]
+  const plan = Model.touchBindPlan(screens, touchMonitors)
+  assert.equal(plan.bindings[0].output, "eDP-1")
+})
+
+test("a wired panel with no digitizer yet asks for one retry", () => {
+  const plan = Model.touchBindPlan([], touchMonitors)
+  assert.equal(plan.retry, true)
+  assert.equal(plan.lua, "")
+})
+
+test("a headless output is not a touch target even with a fake size", () => {
+  const screens = Model.touchscreensFrom(touchProc, touchUdev)
+  const plan = Model.touchBindPlan(screens, [
+    { name: "eDP-1", physicalWidth: 310, physicalHeight: 170, transform: 0 },
+    { name: "persistent-miracast", physicalWidth: 340, physicalHeight: 190, transform: 0 }
+  ])
+  assert.equal(plan.bindings.length, 0)
+  assert.equal(plan.retry, false)
+})

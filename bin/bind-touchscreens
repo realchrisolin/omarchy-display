@@ -1,0 +1,55 @@
+#!/usr/bin/env node
+// Print a touch-bind plan for the displays Hyprland has initialized.
+// stdout is JSON: { bindings, lua, retry }. The caller evals `lua` with
+// hyprctl. This does not modeset.
+"use strict"
+
+const fs = require("fs")
+const path = require("path")
+const { execFileSync } = require("child_process")
+const LayoutModel = require(path.join(__dirname, "..", "LayoutModel.js"))
+
+function readTouchscreens() {
+  let proc = ""
+  try {
+    proc = fs.readFileSync("/proc/bus/input/devices", "utf8")
+  } catch (e) {
+    proc = ""
+  }
+  const records = LayoutModel.parseProcInputDevices(proc)
+  const udevByEvent = {}
+  for (let i = 0; i < records.length; i++) {
+    const event = records[i].event
+    let dev = ""
+    try {
+      dev = fs.readFileSync("/sys/class/input/" + event + "/dev", "utf8").trim()
+    } catch (e) {
+      continue
+    }
+    try {
+      udevByEvent[event] = fs.readFileSync("/run/udev/data/c" + dev, "utf8")
+    } catch (e) {
+      udevByEvent[event] = ""
+    }
+  }
+  return LayoutModel.touchscreensFrom(proc, udevByEvent)
+}
+
+let raw = ""
+try {
+  raw = execFileSync("hyprctl", ["monitors", "all", "-j"], { encoding: "utf8" })
+} catch (e) {
+  process.stderr.write(String((e && e.stderr) || (e && e.message) || e) + "\n")
+  process.exit(1)
+}
+
+let monitors = []
+try {
+  monitors = JSON.parse(raw)
+} catch (e) {
+  process.stderr.write("hyprctl monitors JSON: " + e.message + "\n")
+  process.exit(1)
+}
+if (!Array.isArray(monitors)) monitors = []
+
+process.stdout.write(JSON.stringify(LayoutModel.touchBindPlan(readTouchscreens(), monitors)))

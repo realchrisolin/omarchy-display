@@ -11,6 +11,10 @@ Bar entry is `DisplayPanel.qml` (`Panel.qml` is kept for merging upstream).
 
 ### Added
 
+- Wired touchscreens are mapped onto the display they belong to when that
+  display is initialized. udev `ID_INPUT_TOUCHSCREEN` and `ID_INTEGRATION`
+  pick the digitizer; the panel's EDID size and the monitor transform already
+  applied pick the output. A headless Miracast head is not a target.
 - Miracast / Wi-Fi Display in the Display widget (scan, connect, mirror and
   extend). Virtual Extend heads are packed with physical displays and never
   written as `hl.monitor` rules.
