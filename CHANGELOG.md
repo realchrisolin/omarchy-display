@@ -40,6 +40,9 @@ Bar entry is `DisplayPanel.qml` (`Panel.qml` is kept for merging upstream).
 
 ### Fixed
 
+- A cast that exits during DHCP or connecting is reported as an error.
+  A leftover P2P group interface no longer keeps the panel on "waiting
+  for sink IP".
 - Left/right drops on DISPLAY SETTINGS stay in the row; a mainly vertical
   drag still stacks above or below.
 - Physical scale and rotation persist across `hyprctl reload` through

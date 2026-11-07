@@ -9,6 +9,7 @@ cd "$ROOT"
 echo "==> Unit tests"
 node --test tests/*.test.cjs
 python3 tests/test_identify_display_capabilities.py
+python3 scripts/test_persist_idle_status.py
 
 echo "==> Manifest"
 if command -v omarchy-plugin-validate >/dev/null; then

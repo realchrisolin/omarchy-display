@@ -5132,13 +5132,11 @@ PY
 }
 
 persist_idle_if_cast_pid_dead() {
-  # status.json can keep running=true / phase=connecting after python exits.
-  # The dropdown then looks busy (Stop instead of Reconnect). Persist idle
-  # (or running=false while a leftover GO is still up) when both the wrapper
-  # pid and FluxCast python are gone.
-  if connecting_lock_fresh; then
-    return 0
-  fi
+  # status.json can keep running=true / phase=dhcp after python exits.
+  # A fresh connecting.lock used to hide that for 180s, and a leftover GO
+  # interface kept the panel on "waiting for sink IP" after DHCP had
+  # already failed. Rewrite status when both the wrapper pid and FluxCast
+  # python are gone. Do not remove the group or move the virtual head.
   local wrap=""
   [[ -f "$PID_FILE" ]] && wrap="$(tr -d '[:space:]' <"$PID_FILE" 2>/dev/null || true)"
   if [[ -n "$wrap" ]] && kill -0 "$wrap" 2>/dev/null; then
@@ -5151,45 +5149,7 @@ persist_idle_if_cast_pid_dead() {
   [[ -f "$STATUS_FILE" ]] || return 0
   local link_up="false"
   if p2p_group_up; then link_up="true"; fi
-  python3 - "$STATUS_FILE" "$link_up" <<'PY'
-import json, os, sys, time
-path, link_up = sys.argv[1], sys.argv[2]
-try:
-    data = json.load(open(path))
-except Exception:
-    raise SystemExit(0)
-if not isinstance(data, dict):
-    raise SystemExit(0)
-phase = str(data.get("phase") or "")
-running = data.get("running") in (True, "true", "1", "yes", 1)
-stale_phase = phase in ("connecting", "dhcp", "rtsp", "streaming", "scanning")
-pid = str(data.get("pid") or "").strip()
-if pid.isdigit():
-    try:
-        os.kill(int(pid), 0)
-    except OSError:
-        pass
-    else:
-        raise SystemExit(0)
-if not running and not stale_phase:
-    raise SystemExit(0)
-out = {k: data[k] for k in ("peer", "peerName", "mode") if data.get(k)}
-out["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-out["running"] = False
-out["pid"] = None
-if link_up == "true":
-    if phase not in ("dhcp", "rtsp", "streaming"):
-        phase = "dhcp"
-        data["message"] = "P2P up; waiting for sink IP / RTSP"
-    out["phase"] = phase
-    out["message"] = data.get("message") or "P2P up; waiting for sink IP / RTSP"
-else:
-    out["phase"] = "idle"
-    out["message"] = "Idle"
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(out, f, separators=(",", ":"))
-    f.write("\n")
-PY
+  python3 "$PLUGIN_DIR/scripts/persist_idle_status.py" "$STATUS_FILE" "$link_up"
 }
 
 p2p_group_up() {
